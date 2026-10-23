@@ -1,5 +1,8 @@
 {
   "appId": "com.shixu.checklist",
   "appName": "拾序",
-  "webDir": "dist"
+  "webDir": "dist",
+  "android": {
+    "adjustMarginsForEdgeToEdge": "auto"
+  }
 }

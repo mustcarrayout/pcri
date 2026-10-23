@@ -1,27 +1,37 @@
 <script setup lang="ts">
-import { Capacitor } from "@capacitor/core";
+import { Capacitor, CapacitorHttp } from "@capacitor/core";
 import {
   CapacitorSQLite,
   SQLiteConnection,
   type SQLiteDBConnection,
 } from "@capacitor-community/sqlite";
 import { SpeechRecognition } from "@capacitor-community/speech-recognition";
-import { computed, onMounted, ref, watch } from "vue";
+import { SecureStoragePlugin } from "capacitor-secure-storage-plugin";
+import { LocalNotifications } from "@capacitor/local-notifications";
+import { getDayMeta } from "./calendarMeta";
+import {
+  isDue,
+  loadFiredMap,
+  loadRoutines,
+  saveFiredMap,
+  saveRoutines,
+  type Routine,
+} from "./routines";
+import { computed, nextTick, onMounted, ref, watch } from "vue";
 import {
   ArrowRight,
   CalendarDays,
   Check,
   ChevronLeft,
   ChevronRight,
-  CircleHelp,
   Clock3,
-  CloudDownload,
   ListChecks,
   LogOut,
   Mic,
   MessageCircle,
   Plus,
   Send,
+  Settings,
   Sparkles,
   Tag,
   Trash2,
@@ -48,7 +58,50 @@ interface CalendarEvent {
 interface ChatMessage {
   role: "user" | "assistant";
   content: string;
+  suggestions?: EventSuggestion[];
+  saved?: boolean[];
 }
+interface EventSuggestion {
+  title: string;
+  date: string;
+  time: string;
+  category: Category;
+  tags: string[];
+  important: boolean;
+  urgent: boolean;
+}
+type AiProvider = "deepseek" | "zhipu";
+interface AiConfig {
+  provider: AiProvider;
+  apiKey: string;
+  model: string;
+}
+const aiProviderList: {
+  id: AiProvider;
+  label: string;
+  endpoint: string;
+  defaultModel: string;
+  note: string;
+}[] = [
+  {
+    id: "deepseek",
+    label: "DeepSeek",
+    endpoint: "https://api.deepseek.com/chat/completions",
+    defaultModel: "deepseek-chat",
+    note: "在 platform.deepseek.com 获取",
+  },
+  {
+    id: "zhipu",
+    label: "智谱 GLM",
+    endpoint: "https://open.bigmodel.cn/api/paas/v4/chat/completions",
+    defaultModel: "glm-4-flash",
+    note: "在 open.bigmodel.cn 获取",
+  },
+];
+function providerInfo(id: AiProvider) {
+  return aiProviderList.find((item) => item.id === id) || aiProviderList[0];
+}
+const aiStorageKey = "shixu-ai-config-v1";
 
 const categoryNames: Record<Category, string> = {
   work: "工作",
@@ -56,11 +109,26 @@ const categoryNames: Record<Category, string> = {
   plan: "计划",
 };
 const categories: Category[] = ["work", "interest", "plan"];
-const steps: { id: Step; label: string; prompt: string }[] = [
-  { id: "plan", label: "Plan 计划", prompt: "目标是什么？打算怎么做？" },
-  { id: "do", label: "Do 执行", prompt: "实际做了什么？" },
-  { id: "check", label: "Check 检查", prompt: "结果如何？有哪些差异？" },
-  { id: "act", label: "Act 调整", prompt: "下一轮如何改进？" },
+const steps: { id: Step; label: string; short: string; prompt: string }[] = [
+  {
+    id: "plan",
+    label: "Plan 计划",
+    short: "P 计划",
+    prompt: "目标是什么？打算怎么做？",
+  },
+  { id: "do", label: "Do 执行", short: "D 执行", prompt: "实际做了什么？" },
+  {
+    id: "check",
+    label: "Check 检查",
+    short: "C 检查",
+    prompt: "结果如何？有哪些差异？",
+  },
+  {
+    id: "act",
+    label: "Act 调整",
+    short: "A 调整",
+    prompt: "下一轮如何改进？",
+  },
 ];
 const monthNames = [
   "一月",
@@ -84,39 +152,127 @@ const dateKey = (value: Date) =>
   new Date(value.getTime() - value.getTimezoneOffset() * 60_000)
     .toISOString()
     .slice(0, 10);
-const today = dateKey(now);
+const today = ref(dateKey(now));
 
 const name = ref("");
 const signedIn = ref(false);
 const events = ref<CalendarEvent[]>([]);
-const view = ref<"year" | "month" | "day">("day");
+const view = ref<"year" | "month" | "week" | "day">("day");
 const activeQuadrant = ref("");
 const year = ref(now.getFullYear());
 const month = ref(now.getMonth());
-const selectedDate = ref(today);
+const selectedDate = ref(today.value);
 const database = ref("初始化日历…");
 const dbNotice = ref("");
 const db = ref<SQLiteDBConnection | null>(null);
-const dialog = ref<"event" | "dingtalk" | "">("");
-const pdcaOpen = ref(false);
+const dialog = ref<"settings" | "pdca" | "routines" | "">("");
 const search = ref("");
-const form = ref({
-  id: "",
-  title: "",
-  date: today,
-  time: "09:00",
-  category: "" as Category | "",
-  tags: "",
-  important: false,
-  urgent: false,
-  voiceNote: "",
-  reflection: "",
-  pdca: { plan: "", do: "", check: "", act: "" },
-});
 const messages = ref<ChatMessage[]>([]);
 const chatText = ref("");
 const chatBusy = ref(false);
-const voiceError = ref("");
+const chatListening = ref(false);
+const chatHistoryEl = ref<HTMLElement | null>(null);
+const chatOpen = ref(false);
+const aiConfig = ref<AiConfig | null>(null);
+const aiForm = ref<AiConfig>({
+  provider: "deepseek",
+  apiKey: "",
+  model: aiProviderList[0].defaultModel,
+});
+const aiError = ref("");
+const pdcaTargetId = ref("");
+const pdcaStage = ref<Step>("plan");
+const pdcaForm = ref<Record<Step, string>>({
+  plan: "",
+  do: "",
+  check: "",
+  act: "",
+});
+const pdcaHint = ref("");
+const formDictating = ref(false);
+const formParsing = ref(false);
+async function aiDictateRoutine() {
+  if (formDictating.value) {
+    stopVoice();
+    formDictating.value = false;
+    return;
+  }
+  if (formParsing.value) return;
+  if (!aiConfig.value) {
+    routineError.value = "先在右上角配置模型 API Key，才能智能听写。";
+    return;
+  }
+  formDictating.value = true;
+  routineError.value = "";
+  try {
+    const transcript = await transcribe();
+    if (!transcript) {
+      routineError.value = "没有识别到语音。";
+      return;
+    }
+    formParsing.value = true;
+    const result = await postModelChat({
+      model: aiConfig.value.model,
+      messages: [
+        {
+          role: "system",
+          content: `你是定时任务表单解析器。从用户的一句话提取每日任务信息，只输出 JSON：{"name":"任务短名","prompt":"生成内容的具体指令","time":"HH:MM","endTime":"HH:MM 或空"}。时间表达（每天晚上九点半）换算成 24 小时制 HH:MM；没提到结束时间 endTime 留空；prompt 把口语扩写成给 AI 的清晰生成指令。不要输出 JSON 以外的文字。`,
+        },
+        { role: "user", content: transcript },
+      ],
+      temperature: 0.2,
+      max_tokens: 400,
+      stream: false,
+    });
+    const parsed = extractJsonObject(
+      result.choices?.[0]?.message?.content?.trim() || "",
+    ) as Record<string, unknown> | null;
+    if (!parsed) throw new Error("未能解析内容，请再说一遍。");
+    const name = String(parsed.name || "").trim();
+    if (name) routineForm.value.name = name.slice(0, 20);
+    const prompt = String(parsed.prompt || "").trim();
+    if (prompt) routineForm.value.prompt = prompt.slice(0, 300);
+    const time = String(parsed.time || "").trim();
+    if (/^\d{1,2}:\d{2}$/.test(time)) routineForm.value.time = time.padStart(5, "0");
+    const endTime = String(parsed.endTime || "").trim();
+    if (/^\d{1,2}:\d{2}$/.test(endTime)) routineForm.value.endTime = endTime.padStart(5, "0");
+  } catch (error) {
+    routineError.value =
+      error instanceof Error ? error.message : "识别失败，请重试。";
+  } finally {
+    formDictating.value = false;
+    formParsing.value = false;
+  }
+}
+// 默认标签池 + 用户历史标签，按使用频次合并展示
+const DEFAULT_TAGS = ["会议", "项目", "学习", "阅读", "运动", "健康", "生活"];
+const customTag = ref("");
+const availableTags = computed(() => {
+  const freq = new Map<string, number>();
+  for (const event of events.value)
+    for (const tag of event.tags) freq.set(tag, (freq.get(tag) || 0) + 1);
+  const used = [...freq.entries()]
+    .sort((a, b) => b[1] - a[1])
+    .map(([tag]) => tag);
+  return [...new Set([...used, ...DEFAULT_TAGS])].slice(0, 12);
+});
+const pdcaAiInput = ref("");
+const pdcaAiBusy = ref(false);
+const pdcaAiListening = ref(false);
+// PDCA 是一次执行完的循环，不是分段讨论：一条记录，AI 整圈跑完
+const PDCA_AI_PROMPT =
+  "执行一次完整的 PDCA 循环：把用户的记录落进计划（目标是什么）、执行（实际发生了什么）、检查（结果与差异）、调整（下一轮动作）；记录里没有的阶段保持原样，不要编造。";
+const routines = ref<Routine[]>([]);
+const routineFired = ref<Record<string, string>>({});
+const routineForm = ref({ name: "", prompt: "", time: "21:00", endTime: "" });
+const routineError = ref("");
+const routineListening = ref<"name" | "prompt" | null>(null);
+const appVersion = __APP_VERSION__;
+const buildStamp = (() => {
+  const build = new Date(__BUILD_TIME__);
+  const pad = (n: number) => String(n).padStart(2, "0");
+  return `${pad(build.getMonth() + 1)}${pad(build.getDate())} ${pad(build.getHours())}:${pad(build.getMinutes())}`;
+})();
 const listening = ref(false);
 let speechRecognition: SpeechRecognitionLike | undefined;
 
@@ -151,8 +307,67 @@ const title = computed(() =>
     ? `${year.value} 年`
     : view.value === "month"
       ? `${year.value} 年 ${month.value + 1} 月`
-      : dateTitle.value,
+      : view.value === "week"
+        ? weekTitle.value
+        : dateTitle.value,
 );
+const selectedDayMeta = computed(() =>
+  getDayMeta(new Date(`${selectedDate.value}T12:00:00`)),
+);
+const weekStartDate = computed(() => {
+  const base = new Date(`${selectedDate.value}T12:00:00`);
+  base.setDate(base.getDate() - ((base.getDay() + 6) % 7));
+  return base;
+});
+const weekDays = computed(() =>
+  Array.from({ length: 7 }, (_, index) => {
+    const date = new Date(weekStartDate.value);
+    date.setDate(weekStartDate.value.getDate() + index);
+    const key = dateKey(date);
+    return {
+      key,
+      date,
+      meta: getDayMeta(date),
+      events: events.value.filter((event) => event.date === key),
+    };
+  }),
+);
+const weekTitle = computed(() => {
+  const start = weekStartDate.value;
+  const end = new Date(start);
+  end.setDate(start.getDate() + 6);
+  const format = (date: Date) => `${date.getMonth() + 1}月${date.getDate()}日`;
+  return `${format(start)} – ${format(end)}`;
+});
+const weekReviewCount = computed(() => {
+  const keys = new Set(weekDays.value.map((day) => day.key));
+  return events.value.filter(
+    (event) =>
+      keys.has(event.date) && (event.pdca.check || event.pdca.act),
+  ).length;
+});
+const pdcaEventTitle = computed(
+  () => events.value.find((event) => event.id === pdcaTargetId.value)?.title || "",
+);
+const currentStep = computed(
+  () => steps.find((step) => step.id === pdcaStage.value) || steps[0],
+);
+const pdcaStreak = computed(() => {
+  const hasRecord = (date: Date) =>
+    events.value.some(
+      (event) =>
+        event.date === dateKey(date) &&
+        (Object.values(event.pdca).some(Boolean) || event.reflection),
+    );
+  const cursor = new Date(`${today.value}T12:00:00`);
+  if (!hasRecord(cursor)) cursor.setDate(cursor.getDate() - 1);
+  let streak = 0;
+  while (hasRecord(cursor) && streak < 3650) {
+    streak += 1;
+    cursor.setDate(cursor.getDate() - 1);
+  }
+  return streak;
+});
 const shownEvents = computed(() =>
   events.value
     .filter(
@@ -224,6 +439,7 @@ const days = computed(() => {
       day: day.getDate(),
       inMonth: day.getMonth() === month.value,
       events: events.value.filter((event) => event.date === key),
+      meta: getDayMeta(day),
     };
   });
 });
@@ -233,7 +449,7 @@ function demoEvents(): CalendarEvent[] {
     {
       id: crypto.randomUUID(),
       title: "产品迭代周会",
-      date: today,
+      date: today.value,
       time: "10:00",
       category: "work",
       tags: ["周会", "项目"],
@@ -248,7 +464,7 @@ function demoEvents(): CalendarEvent[] {
     {
       id: crypto.randomUUID(),
       title: "下班后慢跑 5 公里",
-      date: today,
+      date: today.value,
       time: "18:30",
       category: "interest",
       tags: ["跑步", "健康"],
@@ -263,7 +479,7 @@ function demoEvents(): CalendarEvent[] {
     {
       id: crypto.randomUUID(),
       title: "阅读 20 分钟",
-      date: today,
+      date: today.value,
       time: "20:30",
       category: "plan",
       tags: ["阅读"],
@@ -371,10 +587,10 @@ async function openDatabase() {
 async function saveEvents() {
   if (db.value) {
     try {
-      await db.value.execute("DELETE FROM calendar_events");
+      // 逐行 upsert，替代整表清空重写：单行失败不再丢全部数据
       for (const event of events.value)
         await db.value.run(
-          `INSERT INTO calendar_events (id,title,date,time,category,tags,source,done,important,urgent,voice_note,reflection,pdca_plan,pdca_do,pdca_check,pdca_act) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+          `INSERT OR REPLACE INTO calendar_events (id,title,date,time,category,tags,source,done,important,urgent,voice_note,reflection,pdca_plan,pdca_do,pdca_check,pdca_act) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
           [
             event.id,
             event.title,
@@ -394,6 +610,15 @@ async function saveEvents() {
             event.pdca.act,
           ],
         );
+      const ids = events.value
+        .map((event) => `'${event.id.replace(/'/g, "''")}'`)
+        .join(",");
+      await db.value.execute(
+        ids
+          ? `DELETE FROM calendar_events WHERE id NOT IN (${ids})`
+          : "DELETE FROM calendar_events",
+      );
+      dbNotice.value = "";
     } catch (error) {
       dbNotice.value =
         error instanceof Error ? error.message : "SQLite 保存失败";
@@ -401,6 +626,7 @@ async function saveEvents() {
   } else {
     try {
       localStorage.setItem(eventsKey, JSON.stringify(events.value));
+      dbNotice.value = "";
     } catch {
       dbNotice.value = "浏览器无法保存数据";
     }
@@ -432,6 +658,12 @@ function changePeriod(delta: number) {
     const next = new Date(year.value, month.value + delta, 1);
     year.value = next.getFullYear();
     month.value = next.getMonth();
+  } else if (view.value === "week") {
+    const next = new Date(`${selectedDate.value}T12:00:00`);
+    next.setDate(next.getDate() + delta * 7);
+    selectedDate.value = dateKey(next);
+    year.value = next.getFullYear();
+    month.value = next.getMonth();
   } else {
     const next = new Date(`${selectedDate.value}T12:00:00`);
     next.setDate(next.getDate() + delta);
@@ -446,210 +678,1278 @@ function goDay(key: string) {
   month.value = Number(key.slice(5, 7)) - 1;
   view.value = "day";
 }
-function newEvent(key = selectedDate.value) {
-  form.value = {
-    id: "",
-    title: "",
-    date: key,
-    time: "09:00",
-    category: "",
-    tags: "",
-    important: false,
-    urgent: false,
-    voiceNote: "",
-    reflection: "",
-    pdca: { plan: "", do: "", check: "", act: "" },
-  };
-  pdcaOpen.value = false;
-  dialog.value = "event";
+const habitAlertShownOn = ref("");
+function askHabitSignals() {
+  chatOpen.value = true;
+  habitAlertShownOn.value = today.value;
+  void askPi(habitSignals.value.map((signal) => signal.ask).join(" "));
 }
-function editEvent(event: CalendarEvent) {
-  form.value = {
-    id: event.id,
-    title: event.title,
-    date: event.date,
-    time: event.time,
-    category: event.category,
-    tags: event.tags.join(", "),
-    important: event.important,
-    urgent: event.urgent,
-    voiceNote: event.voiceNote,
-    reflection: event.reflection,
-    pdca: { ...event.pdca },
-  };
-  pdcaOpen.value = true;
-  dialog.value = "event";
+function focusOmnibar() {
+  chatOpen.value = true;
+  void nextTick(() =>
+    document.querySelector<HTMLInputElement>(".omnibar input")?.focus(),
+  );
 }
-async function saveEvent() {
-  const tags = form.value.tags
-    .split(/[,，、#]/)
-    .map((tag) => tag.trim())
-    .filter(Boolean);
-  if (!form.value.title.trim() || !form.value.category || !tags.length) return;
-  const old = events.value.find((event) => event.id === form.value.id);
-  const source = old?.source || "personal";
-  const event: CalendarEvent = {
-    id: old?.id || crypto.randomUUID(),
-    title: form.value.title.trim(),
-    date: form.value.date,
-    time: form.value.time,
-    category:
-      source === "dingtalk" ? "work" : (form.value.category as Category),
-    tags: [...new Set(tags)],
-    source,
-    done: old?.done || false,
-    important: form.value.important,
-    urgent: form.value.urgent,
-    voiceNote: form.value.voiceNote,
-    reflection: form.value.reflection,
-    pdca: { ...form.value.pdca },
-  };
-  const index = events.value.findIndex((item) => item.id === event.id);
-  if (index < 0) events.value.push(event);
-  else events.value[index] = event;
-  goDay(event.date);
-  dialog.value = "";
-  await saveEvents();
+// 左右滑动切换时段：日±1天、周±7天、月±1月、年±1年；竖向滚动和输入框不受影响
+let swipeStartX = 0;
+let swipeStartY = 0;
+let swipeOnControl = false;
+function onMainTouchStart(e: TouchEvent) {
+  const target = e.target as HTMLElement | null;
+  swipeOnControl = !!target?.closest("input, textarea, button, a, .chat-card");
+  swipeStartX = e.changedTouches[0].clientX;
+  swipeStartY = e.changedTouches[0].clientY;
 }
-function applyTranscript(target: "title" | "plan" | "reflection" | "check", transcript: string) {
-  if (!transcript) return;
-  if (target === "title")
-    form.value.title = `${form.value.title}${form.value.title ? " " : ""}${transcript}`;
-  else if (target === "plan")
-    form.value.pdca.plan = `${form.value.pdca.plan}${form.value.pdca.plan ? " " : ""}${transcript}`;
-  else if (target === "check")
-    form.value.pdca.check = `${form.value.pdca.check}${form.value.pdca.check ? " " : ""}${transcript}`;
-  else
-    form.value.reflection = `${form.value.reflection}${form.value.reflection ? " " : ""}${transcript}`;
-  form.value.voiceNote = `${form.value.voiceNote}${form.value.voiceNote ? "\n" : ""}${transcript}`;
+function onMainTouchEnd(e: TouchEvent) {
+  if (swipeOnControl) return;
+  const dx = e.changedTouches[0].clientX - swipeStartX;
+  const dy = e.changedTouches[0].clientY - swipeStartY;
+  if (Math.abs(dx) > 60 && Math.abs(dx) > Math.abs(dy) * 1.5)
+    changePeriod(dx < 0 ? 1 : -1);
 }
-
-async function recordVoice(target: "title" | "plan" | "reflection" | "check") {
-  voiceError.value = "";
+async function transcribe(): Promise<string> {
   if (Capacitor.isNativePlatform()) {
-    try {
-      let permission = await SpeechRecognition.checkPermissions();
-      if (permission.speechRecognition !== "granted")
-        permission = await SpeechRecognition.requestPermissions();
-      if (permission.speechRecognition !== "granted") {
-        voiceError.value = "需要麦克风和语音识别权限才能开始录音。";
-        return;
-      }
-      listening.value = true;
-      const result = await SpeechRecognition.start({
-        language: "zh-CN",
-        maxResults: 1,
-        partialResults: false,
-        popup: true,
-      });
-      applyTranscript(target, result.matches?.[0]?.trim() || "");
-    } catch {
-      voiceError.value = "语音识别未能启动，请检查设备语音服务和麦克风权限。";
-    } finally {
-      listening.value = false;
-    }
-    return;
+    let permission = await SpeechRecognition.checkPermissions();
+    if (permission.speechRecognition !== "granted")
+      permission = await SpeechRecognition.requestPermissions();
+    if (permission.speechRecognition !== "granted")
+      throw new Error("需要麦克风和语音识别权限才能开始录音。");
+    const result = await SpeechRecognition.start({
+      language: "zh-CN",
+      maxResults: 1,
+      partialResults: false,
+      popup: true,
+    });
+    return result.matches?.[0]?.trim() || "";
   }
-
   const speechWindow = window as SpeechWindow;
   const Recognition =
     speechWindow.SpeechRecognition || speechWindow.webkitSpeechRecognition;
-  if (!Recognition) {
-    voiceError.value = "当前浏览器不支持语音识别，请使用 Android Chrome。";
+  if (!Recognition) throw new Error("当前环境不支持语音识别，请直接输入。");
+  return await new Promise<string>((resolve, reject) => {
+    const recognition = new Recognition();
+    speechRecognition = recognition;
+    let settled = false;
+    const finish = (settle: () => void) => {
+      if (settled) return;
+      settled = true;
+      settle();
+    };
+    recognition.lang = "zh-CN";
+    recognition.interimResults = false;
+    recognition.onresult = (event) => {
+      const transcript = Array.from(event.results)
+        .map((result) => result[0]?.transcript || "")
+        .join("")
+        .trim();
+      finish(() => resolve(transcript));
+    };
+    recognition.onerror = () =>
+      finish(() => reject(new Error("没有识别到语音，请检查麦克风权限。")));
+    recognition.onend = () => {
+      speechRecognition = undefined;
+      finish(() => resolve(""));
+    };
+    recognition.start();
+  });
+}
+async function toggleChatVoice() {
+  if (chatListening.value) {
+    stopVoice();
+    chatListening.value = false;
     return;
   }
-  voiceError.value = "";
-  const recognition = new Recognition();
-  speechRecognition = recognition;
-  recognition.lang = "zh-CN";
-  recognition.interimResults = false;
-  listening.value = true;
-  recognition.onresult = (event) => {
-    const transcript = Array.from(event.results)
-      .map((result) => result[0]?.transcript || "")
-      .join("")
-      .trim();
-    applyTranscript(target, transcript);
-  };
-  recognition.onerror = () => {
-    voiceError.value = "没有识别到语音，请检查麦克风权限。";
-    listening.value = false;
-  };
-  recognition.onend = () => {
-    listening.value = false;
-    speechRecognition = undefined;
-  };
-  recognition.start();
+  chatListening.value = true;
+  try {
+    const transcript = await transcribe();
+    if (transcript)
+      chatText.value = chatText.value
+        ? `${chatText.value} ${transcript}`
+        : transcript;
+  } catch (error) {
+    messages.value.push({
+      role: "assistant",
+      content:
+        error instanceof Error ? error.message : "语音识别失败，请再试一次。",
+    });
+  } finally {
+    chatListening.value = false;
+  }
 }
 function stopVoice() {
   speechRecognition?.stop();
   if (Capacitor.isNativePlatform()) void SpeechRecognition.stop();
 }
-async function importDingTalkDemo() {
+async function loadAiConfig() {
+  if (!Capacitor.isNativePlatform()) return; // 浏览器预览不落盘，密钥只在当前页面内存里
+  try {
+    const { value } = await SecureStoragePlugin.get({ key: aiStorageKey });
+    const parsed = JSON.parse(value) as AiConfig;
+    if (parsed?.apiKey) aiConfig.value = parsed;
+  } catch {
+    /* 尚未配置过 */
+  }
+}
+async function persistAiConfig(config: AiConfig) {
+  if (!Capacitor.isNativePlatform()) return; // 真机才写入 Android Keystore 安全存储
+  await SecureStoragePlugin.set({
+    key: aiStorageKey,
+    value: JSON.stringify(config),
+  });
+}
+function openAiSettings() {
+  aiForm.value = aiConfig.value
+    ? { ...aiConfig.value }
+    : {
+        provider: "deepseek",
+        apiKey: "",
+        model: aiProviderList[0].defaultModel,
+      };
+  aiError.value = "";
+  dialog.value = "settings";
+}
+function chooseProvider(provider: AiProvider) {
+  aiForm.value.provider = provider;
+  aiForm.value.model = providerInfo(provider).defaultModel;
+}
+async function saveAiSettings() {
+  const apiKey = aiForm.value.apiKey.trim();
+  if (!apiKey) return;
+  const config: AiConfig = {
+    provider: aiForm.value.provider,
+    apiKey,
+    model:
+      aiForm.value.model.trim() ||
+      providerInfo(aiForm.value.provider).defaultModel,
+  };
+  try {
+    await persistAiConfig(config);
+  } catch {
+    aiError.value = "安全存储写入失败，请重试。";
+    return;
+  }
+  aiError.value = "";
+  aiConfig.value = config;
+  dialog.value = "";
+}
+async function clearAiSettings() {
+  if (Capacitor.isNativePlatform()) {
+    try {
+      await SecureStoragePlugin.remove({ key: aiStorageKey });
+    } catch {
+      /* 本地状态仍会清除 */
+    }
+  }
+  aiConfig.value = null;
+  dialog.value = "";
+}
+function piSystemPrompt() {
+  const agenda = events.value
+    .filter((event) => event.date === selectedDate.value)
+    .sort((a, b) => a.time.localeCompare(b.time))
+    .map(
+      (event) =>
+        `${event.time} ${event.title}（${categoryNames[event.category]}；${
+          event.important ? "重要" : "不重要"
+        }${event.urgent ? "且紧急" : event.important ? "不紧急" : ""}；${
+          event.done ? "已完成" : "未完成"
+        }）`,
+    );
+  return [
+    `你是个人日历应用「拾序」里的私人助理 Pi，用户是「${name.value}」。语气像熟悉的朋友：鼓励、不说教、不堆客套话，帮 TA 强化习惯、按自己的节奏生活。`,
+    "用简体中文简短、可执行地回答。",
+    "回答使用纯文本：不要使用 Markdown 标记（如 ** 加粗、# 标题、` 代码、- 或 * 列表符号），列表直接一行一条写。",
+    `今天的日期是 ${selectedDate.value}。`,
+    `当天日程：${agenda.length ? agenda.join("；") : "暂无安排"}。`,
+    "事项按重要/紧急四象限整理，用户会为事项写 PDCA 循环笔记。",
+  ].join("\n");
+}
+interface ModelChatResult {
+  choices?: {
+    message?: {
+      content?: string;
+      tool_calls?: {
+        id?: string;
+        function?: { name?: string; arguments?: string };
+      }[];
+    };
+  }[];
+  error?: { message?: string } | string;
+}
+function modelReply(result: ModelChatResult) {
+  const raw = result.choices?.[0]?.message?.content?.trim() || "";
+  return raw
+    .split("\n")
+    .map((line) =>
+      line
+        .replace(/^#{1,6}\s*/, "")
+        .replace(/^[-*]\s+/, "· ")
+        .replace(/\*\*([^*]+)\*\*/g, "$1")
+        .replace(/`([^`]*)`/g, "$1"),
+    )
+    .join("\n")
+    .replace(/\*\*/g, "")
+    .trim();
+}
+function modelErrorMessage(result: ModelChatResult, status: number) {
+  if (typeof result.error === "string") return result.error;
+  if (result.error?.message) return result.error.message;
+  return `模型服务返回 ${status}`;
+}
+// 真机走 Capacitor 原生网络栈，不受 WebView CORS 限制；浏览器预览回落到 fetch
+async function postModelChat(
+  payload: Record<string, unknown>,
+): Promise<ModelChatResult> {
+  if (!aiConfig.value) throw new Error("未配置模型。");
+  const provider = providerInfo(aiConfig.value.provider);
+  const headers = {
+    "Content-Type": "application/json",
+    Authorization: `Bearer ${aiConfig.value.apiKey}`,
+  };
+  if (Capacitor.isNativePlatform()) {
+    const response = await CapacitorHttp.post({
+      url: provider.endpoint,
+      headers,
+      data: payload,
+      connectTimeout: 15000,
+      readTimeout: 60000,
+    });
+    const result = (response.data || {}) as ModelChatResult;
+    if (response.status >= 400)
+      throw new Error(modelErrorMessage(result, response.status));
+    return result;
+  }
+  const response = await fetch(provider.endpoint, {
+    method: "POST",
+    headers,
+    body: JSON.stringify(payload),
+  });
+  const result = ((await response.json().catch(() => ({}))) ||
+    {}) as ModelChatResult;
+  if (!response.ok) throw new Error(modelErrorMessage(result, response.status));
+  return result;
+}
+// Pi 工具驱动：模型通过工具读写日历，App 本地执行；写入类操作经确认卡落库
+const PI_AGENT_PROMPT =
+  "你可以使用工具驱动这个日历应用：query_day 查询某天日程；plan_goal 把用户的目标拆解成 2-8 个颗粒度合适（每件 30-90 分钟、渐进递进）的任务写入日历，所有任务共用 goal_tag 追踪进度，完成时会用费曼检验验收；propose_event 建议新事项（生成确认卡片，用户点击后写入日历）；propose_pdca 为已有事项建议 PDCA 内容；start_feynman 用费曼学习法检验用户是否真的学会了；save_feynman_result 在检验结束时记录结果。用户完成目标任务后，主动用费曼验收推动进步。根据学习档案衔接上次的差距，推着用户有目标地进步，不要漫无目的。";
+const PI_TOOLS = [
+  {
+    type: "function",
+    function: {
+      name: "update_event",
+      description:
+        "修改用户已有的某个事项（改名/改日期/改时间/改重要紧急）。修改会直接应用，完成后告知用户改了什么。",
+      parameters: {
+        type: "object",
+        properties: {
+          event_title: {
+            type: "string",
+            description: "目标事项的名称或名称的一部分",
+          },
+          new_title: { type: "string", description: "新名称；不改则留空" },
+          date: { type: "string", description: "新日期 YYYY-MM-DD；不改则留空" },
+          time: { type: "string", description: "新时间 HH:MM；不改则留空" },
+          important: { type: "boolean", description: "是否重要" },
+          urgent: { type: "boolean", description: "是否紧急" },
+        },
+        required: ["event_title"],
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "start_feynman",
+      description:
+        "开始费曼学习检验：让用户用自己的话、像讲给 12 岁孩子一样简单讲解一个刚学的概念，用来判断是否真的学会了。用户提到学了什么、想检验学习效果时调用。",
+      parameters: {
+        type: "object",
+        properties: {
+          topic: { type: "string", description: "要检验的概念或知识点" },
+          event_title: {
+            type: "string",
+            description: "关联的学习类事项名称；没有就留空",
+          },
+        },
+        required: ["topic"],
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "save_feynman_result",
+      description:
+        "费曼检验对话结束（用户讲完、你已判断）时调用：记录理解程度、讲清楚了什么、没讲清楚的差距和下一步。会写入学习档案并更新关联事项的 PDCA 检查/调整。",
+      parameters: {
+        type: "object",
+        properties: {
+          topic: { type: "string", description: "检验的概念" },
+          level: {
+            type: "string",
+            enum: ["solid", "shaky", "lost"],
+            description: "solid=讲清楚了 shaky=部分卡壳 lost=讲不出来",
+          },
+          strengths: { type: "string", description: "讲清楚了的部分" },
+          gaps: { type: "string", description: "没讲清楚、理解的差距" },
+          next_action: {
+            type: "string",
+            description: "下一步要补什么、怎么补",
+          },
+          event_title: {
+            type: "string",
+            description: "关联的学习类事项名称；没有就留空",
+          },
+        },
+        required: ["topic", "level", "gaps"],
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "query_day",
+      description: "查询某一天的日程安排",
+      parameters: {
+        type: "object",
+        properties: {
+          date: {
+            type: "string",
+            description: "日期，格式 YYYY-MM-DD；不填默认当前查看的一天",
+          },
+        },
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "propose_event",
+      description:
+        "建议用户新建一个日历事项。会生成确认卡片，用户点击确认后才会真正加入日历。",
+      parameters: {
+        type: "object",
+        properties: {
+          title: { type: "string", description: "事项名称" },
+          date: { type: "string", description: "日期，格式 YYYY-MM-DD" },
+          time: { type: "string", description: "时间，格式 HH:MM" },
+          category: {
+            type: "string",
+            enum: ["work", "interest", "plan"],
+            description: "归属类别：工作/兴趣/计划",
+          },
+          tags: {
+            type: "array",
+            items: { type: "string" },
+            description: "标签数组，可为空",
+          },
+          important: { type: "boolean", description: "是否重要" },
+          urgent: { type: "boolean", description: "是否紧急" },
+        },
+        required: ["title", "date", "category"],
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "plan_goal",
+      description:
+        "把用户的一个目标拆分成 n 个合适颗粒度（每件 30-90 分钟能完成、渐进递进）的任务并写入日历。所有任务自动带上目标标签用于追踪进度，每个任务的 plan 会写入它的 PDCA；用户完成任务时会用费曼学习法验收成果。",
+      parameters: {
+        type: "object",
+        properties: {
+          goal: { type: "string", description: "用户的原始目标" },
+          goal_tag: {
+            type: "string",
+            description: "目标短标签（2-6 字），如「费曼学习」；所有任务共用，用于追踪进度",
+          },
+          start_date: {
+            type: "string",
+            description: "第一个任务的日期，格式 YYYY-MM-DD",
+          },
+          category: {
+            type: "string",
+            enum: ["work", "interest", "plan"],
+            description: "归属类别",
+          },
+          tasks: {
+            type: "array",
+            description:
+              "拆分后的任务，按时间顺序，2-8 个；颗粒度=每件 30-90 分钟；循序渐进，后一个建立在前一个之上",
+            items: {
+              type: "object",
+              properties: {
+                title: { type: "string", description: "任务名，具体可完成" },
+                offset_days: {
+                  type: "number",
+                  description: "距第一天的天数偏移，0=第一天",
+                },
+                time: { type: "string", description: "时间 HH:MM，可省略默认 09:00" },
+                plan: {
+                  type: "string",
+                  description: "这个任务的做法/方法论，写入它的 PDCA 计划",
+                },
+              },
+              required: ["title", "offset_days", "plan"],
+            },
+          },
+        },
+        required: ["goal", "goal_tag", "start_date", "category", "tasks"],
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "propose_pdca",
+      description:
+        "为用户已有的某个事项建议 PDCA 内容（计划/执行/检查/调整），应用后告知用户写到了哪个事项。",
+      parameters: {
+        type: "object",
+        properties: {
+          event_title: {
+            type: "string",
+            description: "目标事项的名称或名称的一部分",
+          },
+          plan: { type: "string", description: "计划；无则留空" },
+          do: { type: "string", description: "执行；无则留空" },
+          check: { type: "string", description: "检查；无则留空" },
+          act: { type: "string", description: "调整；无则留空" },
+        },
+        required: ["event_title"],
+      },
+    },
+  },
+];
+function toolQueryDay(args: Record<string, unknown>): Record<string, unknown> {
+  const raw = String(args.date || "").trim();
+  const key = /^\d{4}-\d{2}-\d{2}$/.test(raw) ? raw : selectedDate.value;
+  const agenda = events.value
+    .filter((event) => event.date === key)
+    .sort((a, b) => a.time.localeCompare(b.time))
+    .map((event) => ({
+      time: event.time,
+      title: event.title,
+      category: event.category,
+      done: event.done,
+    }));
+  return { date: key, count: agenda.length, agenda };
+}
+async function toolPlanGoal(
+  args: Record<string, unknown>,
+): Promise<Record<string, unknown>> {
+  const goal = String(args.goal || "").trim();
+  const goalTag = String(args.goal_tag || "")
+    .trim()
+    .slice(0, 8);
+  const startDate = String(args.start_date || "").trim();
+  const category =
+    args.category === "work" || args.category === "interest"
+      ? args.category
+      : "plan";
+  const tasks = Array.isArray(args.tasks) ? args.tasks : [];
+  if (!goal || !goalTag || !/^\d{4}-\d{2}-\d{2}$/.test(startDate))
+    return { error: "goal、goal_tag、start_date(YYYY-MM-DD) 为必填" };
+  if (!tasks.length || tasks.length > 8)
+    return { error: "tasks 需要 2-8 个任务" };
+  const created: { title: string; date: string }[] = [];
+  for (const raw of tasks) {
+    const task = (raw || {}) as Record<string, unknown>;
+    const title = String(task.title || "")
+      .trim()
+      .slice(0, 60);
+    const offset = Number(task.offset_days);
+    if (!title || !Number.isFinite(offset) || offset < 0) continue;
+    const date = new Date(`${startDate}T12:00:00`);
+    date.setDate(date.getDate() + Math.floor(offset));
+    const dateKeyStr = dateKey(date);
+    const time = /^\d{1,2}:\d{2}$/.test(String(task.time || ""))
+      ? String(task.time).padStart(5, "0")
+      : "09:00";
+    events.value.push({
+      id: crypto.randomUUID(),
+      title,
+      date: dateKeyStr,
+      time,
+      category,
+      tags: [...new Set([`目标·${goalTag}`])],
+      source: "personal",
+      done: false,
+      important: true,
+      urgent: false,
+      voiceNote: "",
+      reflection: "",
+      pdca: {
+        plan: String(task.plan || "").trim(),
+        do: "",
+        check: "",
+        act: "",
+      },
+    });
+    created.push({ title, date: dateKeyStr });
+  }
+  if (!created.length)
+    return { error: "没有有效的任务（需要 title 和 offset_days）" };
+  await saveEvents();
+  return {
+    ok: true,
+    goal,
+    goal_tag: `目标·${goalTag}`,
+    created: created.length,
+    tasks: created,
+    note: "已写入日历。告知用户：每完成一个任务勾选时，会自动进入费曼验收；全部完成即目标达成",
+  };
+}
+function toolProposeEvent(
+  args: Record<string, unknown>,
+  suggestions: EventSuggestion[],
+): Record<string, unknown> {
+  const title = String(args.title || "")
+    .trim()
+    .slice(0, 60);
+  const date = String(args.date || "").trim();
+  if (!title || !/^\d{4}-\d{2}-\d{2}$/.test(date))
+    return { error: "title 与 date(YYYY-MM-DD) 为必填" };
+  const category =
+    args.category === "work" || args.category === "interest"
+      ? args.category
+      : "plan";
+  const tags = Array.isArray(args.tags)
+    ? args.tags.map((tag) => String(tag).trim()).filter(Boolean)
+    : [];
+  suggestions.push({
+    title,
+    date,
+    time: /^\d{1,2}:\d{2}$/.test(String(args.time || ""))
+      ? String(args.time).padStart(5, "0")
+      : "09:00",
+    category,
+    tags,
+    important: Boolean(args.important),
+    urgent: Boolean(args.urgent),
+  });
+  return {
+    ok: true,
+    title,
+    date,
+    note: "已生成确认卡片，等待用户点击加入日历",
+  };
+}
+interface LearningCheck {
+  date: string;
+  topic: string;
+  level: "solid" | "shaky" | "lost";
+  strengths: string;
+  gaps: string;
+  next: string;
+}
+const LEARNING_KEY = "shixu-learning-v1";
+const learningLog = ref<LearningCheck[]>([]);
+function loadLearningLog() {
+  try {
+    const parsed = JSON.parse(
+      localStorage.getItem(LEARNING_KEY) || "[]",
+    ) as LearningCheck[];
+    learningLog.value = Array.isArray(parsed) ? parsed : [];
+  } catch {
+    learningLog.value = [];
+  }
+}
+function saveLearningLog() {
+  localStorage.setItem(LEARNING_KEY, JSON.stringify(learningLog.value));
+}
+const levelLabels: Record<LearningCheck["level"], string> = {
+  solid: "讲清楚了",
+  shaky: "部分卡壳",
+  lost: "还讲不出来",
+};
+const feynmanWeek = computed(() => {
+  const keys = new Set(weekDays.value.map((day) => day.key));
+  return learningLog.value.filter((item) => keys.has(item.date)).length;
+});
+// 诚实的循环状态：今天的计划→完成→复盘→费曼，零就是零，断在哪一眼可见
+const loopStatus = computed(() => {
+  const dayEvents = events.value.filter(
+    (event) => event.date === selectedDate.value,
+  );
+  return {
+    streak: pdcaStreak.value,
+    planned: dayEvents.length,
+    done: dayEvents.filter((event) => event.done).length,
+    reviewed: dayEvents.filter(
+      (event) => event.pdca.check || event.pdca.act,
+    ).length,
+    feynman: learningLog.value.filter(
+      (item) => item.date === selectedDate.value,
+    ).length,
+  };
+});
+// 习惯信号：全部来自本地数据的客观规则，可解释、不玄学
+interface HabitSignal {
+  id: string;
+  message: string;
+  ask: string;
+}
+const habitSignals = computed<HabitSignal[]>(() => {
+  const out: HabitSignal[] = [];
+  const dayBefore = dateKey(
+    new Date(new Date(`${today.value}T12:00:00`).getTime() - 86400000),
+  );
+  const yEvents = events.value.filter((event) => event.date === dayBefore);
+  const yDone = yEvents.filter((event) => event.done);
+  const yReviewed = yEvents.filter(
+    (event) => event.pdca.check || event.pdca.act,
+  );
+  if (yDone.length && !yReviewed.length)
+    out.push({
+      id: "stale_review",
+      message: `昨天完成了 ${yDone.length} 件事但没写复盘`,
+      ask: `我昨天完成了 ${yDone.length} 件事但没写复盘，帮我逐一补上 Check（结果与差异）和 Act（下一步）。`,
+    });
+  const overdue = events.value.filter(
+    (event) =>
+      !event.done &&
+      event.date < today.value &&
+      event.tags.some((tag) => tag.startsWith("目标·")),
+  );
+  if (overdue.length >= 2) {
+    const tag =
+      overdue[0].tags.find((t) => t.startsWith("目标·")) || "目标";
+    out.push({
+      id: "goal_behind",
+      message: `目标「${tag.replace("目标·", "")}」有 ${overdue.length} 个任务逾期`,
+      ask: `我的「${tag.replace("目标·", "")}」目标有 ${overdue.length} 个任务逾期了，帮我按现状重新拆解和安排。`,
+    });
+  }
+  const recorded = new Set(
+    events.value
+      .filter(
+        (event) =>
+          Object.values(event.pdca).some(Boolean) || event.reflection,
+      )
+      .map((event) => event.date),
+  );
+  let gap = 0;
+  const cursor = new Date(`${today.value}T12:00:00`);
+  if (!recorded.has(today.value)) {
+    cursor.setDate(cursor.getDate() - 1);
+    while (gap < 7 && !recorded.has(dateKey(cursor))) {
+      gap += 1;
+      cursor.setDate(cursor.getDate() - 1);
+    }
+    if (gap >= 2)
+      out.push({
+        id: "gap",
+        message: `已经 ${gap} 天没写 PDCA 了`,
+        ask: `我已经 ${gap} 天没写 PDCA 了，帮我从今天最容易的一件小事 restart。`,
+      });
+  }
+  return out;
+});
+const goalProgress = computed(() => {
+  const stats = new Map<string, { done: number; total: number }>();
+  for (const event of events.value)
+    for (const tag of event.tags)
+      if (tag.startsWith("目标·")) {
+        const stat = stats.get(tag) || { done: 0, total: 0 };
+        stat.total += 1;
+        if (event.done) stat.done += 1;
+        stats.set(tag, stat);
+      }
+  const list = [...stats.entries()];
+  return list.length ? list[list.length - 1] : null;
+});
+async function toolStartFeynman(args: Record<string, unknown>) {
+  const topic = String(args.topic || "").trim();
+  if (!topic) return { error: "topic 必填" };
+  const related = events.value.find(
+    (event) =>
+      event.title.includes(topic) &&
+      [event.pdca.check, event.pdca.act, event.reflection].some(Boolean),
+  );
+  const recent = learningLog.value.slice(-3).map((item) => ({
+    date: item.date,
+    topic: item.topic,
+    level: levelLabels[item.level],
+    next: item.next,
+  }));
+  return {
+    topic,
+    related_event: related?.title || null,
+    related_notes: related
+      ? `计划：${related.pdca.plan || "空"}；检查：${related.pdca.check || "空"}`
+      : null,
+    recent_checks: recent,
+    note: "请让用户用自己的话、像讲给 12 岁孩子一样简单讲解这个概念；听完后诚实评估，讲完两轮或明显卡壳时调用 save_feynman_result",
+  };
+}
+const FEYNMAN_LEVEL_LABEL: Record<string, string> = {
+  solid: "讲清楚了",
+  shaky: "部分卡壳",
+  lost: "还讲不出来",
+};
+async function toolSaveFeynmanResult(args: Record<string, unknown>) {
+  const topic = String(args.topic || "").trim();
+  const level = String(args.level || "") as LearningCheck["level"];
+  if (!topic || !(level in levelLabels))
+    return { error: "topic 和 level(solid/shaky/lost) 为必填" };
+  const strengths = String(args.strengths || "").trim();
+  const gaps = String(args.gaps || "").trim();
+  const next = String(args.next_action || "").trim();
+  const entry: LearningCheck = {
+    date: today.value,
+    topic,
+    level,
+    strengths,
+    gaps,
+    next,
+  };
+  learningLog.value.push(entry);
+  saveLearningLog();
+  const needle = String(args.event_title || "").trim() || topic;
+  const event =
+    events.value.find((item) => item.date === today.value && item.title.includes(needle)) ||
+    events.value.find((item) => item.title.includes(needle));
+  if (event) {
+    if (gaps) event.pdca.check = `费曼检验（${FEYNMAN_LEVEL_LABEL[level]}）：讲清了 ${strengths || "—"}；卡在 ${gaps}`;
+    if (next) event.pdca.act = next;
+    await saveEvents();
+  }
+  return {
+    ok: true,
+    level: FEYNMAN_LEVEL_LABEL[level],
+    wrote_to: event ? event.title : "学习档案（无关联事项）",
+    note: "已记录。请用一句鼓励的话收尾，并结合 gaps 提醒用户下一步。",
+  };
+}
+async function toolUpdateEvent(args: Record<string, unknown>) {
+  const needle = String(args.event_title || "").trim();
+  const event = events.value.find((item) => item.title.includes(needle));
+  if (!event) return { error: `没有找到名称包含「${needle}」的事项` };
+  const changed: string[] = [];
+  const newTitle = String(args.new_title || "").trim();
+  if (newTitle && newTitle !== event.title) {
+    event.title = newTitle.slice(0, 60);
+    changed.push(`名称→${event.title}`);
+  }
+  const date = String(args.date || "").trim();
+  if (/^\d{4}-\d{2}-\d{2}$/.test(date) && date !== event.date) {
+    changed.push(`日期→${date}`);
+    event.date = date;
+  }
+  const time = String(args.time || "").trim();
+  if (/^\d{1,2}:\d{2}$/.test(time) && time !== event.time) {
+    changed.push(`时间→${time}`);
+    event.time = time.padStart(5, "0");
+  }
+  if (typeof args.important === "boolean" && args.important !== event.important) {
+    event.important = args.important;
+    changed.push(args.important ? "标记重要" : "取消重要");
+  }
+  if (typeof args.urgent === "boolean" && args.urgent !== event.urgent) {
+    event.urgent = args.urgent;
+    changed.push(args.urgent ? "标记紧急" : "取消紧急");
+  }
+  if (!changed.length) return { ok: true, event: event.title, note: "没有需要修改的内容" };
+  await saveEvents();
+  return { ok: true, event: event.title, changed };
+}
+async function toolProposePdca(
+  args: Record<string, unknown>,
+): Promise<Record<string, unknown>> {
+  const needle = String(args.event_title || "").trim();
+  const event = events.value.find((item) => item.title.includes(needle));
+  if (!event) return { error: `没有找到名称包含「${needle}」的事项` };
+  const applied: string[] = [];
+  for (const stage of ["plan", "do", "check", "act"] as Step[]) {
+    const value = String(args[stage] || "").trim();
+    if (value) {
+      event.pdca[stage] = value;
+      applied.push(stage);
+    }
+  }
+  if (!applied.length) return { error: "没有提供任何要写入的内容" };
+  await saveEvents();
+  return { ok: true, event: event.title, applied };
+}
+async function executeTool(
+  name: string,
+  args: Record<string, unknown>,
+  suggestions: EventSuggestion[],
+): Promise<Record<string, unknown>> {
+  if (name === "query_day") return toolQueryDay(args);
+  if (name === "plan_goal") return await toolPlanGoal(args);
+  if (name === "update_event") return await toolUpdateEvent(args);
+  if (name === "propose_event") return toolProposeEvent(args, suggestions);
+  if (name === "propose_pdca") return await toolProposePdca(args);
+  if (name === "start_feynman") return await toolStartFeynman(args);
+  if (name === "save_feynman_result")
+    return await toolSaveFeynmanResult(args);
+  return { error: `未知工具 ${name}` };
+}
+async function runPiAgent(
+  userMessage: string,
+): Promise<{ reply: string; suggestions: EventSuggestion[] }> {
+  if (!aiConfig.value) throw new Error("未配置模型。");
+  const chat: Record<string, unknown>[] = [
+    { role: "system", content: `${piSystemPrompt()} ${PI_AGENT_PROMPT} ${
+      learningLog.value.length
+        ? `学习档案（最近的费曼检验）：${learningLog.value
+            .slice(-3)
+            .map(
+              (item) =>
+                `${item.date}「${item.topic}」${levelLabels[item.level]}${
+                  item.next ? `，下次：${item.next}` : ""
+                }`,
+            )
+            .join("；")}。根据档案推着用户进步：衔接上次的差距，别让进步漫无目的。`
+        : ""
+    } ${
+      habitSignals.value.length
+        ? `当前习惯信号（基于客观数据，可主动关心）：${habitSignals.value
+            .map((signal) => signal.message)
+            .join("；")}。适时温和地提醒用户，给具体的补救建议。`
+        : ""
+    }` },
+    ...messages.value
+      .slice(-11, -1)
+      .map(({ role, content }) => ({ role, content })),
+    { role: "user", content: userMessage },
+  ];
+  const suggestions: EventSuggestion[] = [];
+  for (let round = 0; round < 3; round++) {
+    let result: ModelChatResult;
+    try {
+      result = await postModelChat({
+        model: aiConfig.value.model,
+        messages: chat,
+        tools: PI_TOOLS,
+        temperature: 0.5,
+        max_tokens: 900,
+        stream: false,
+      });
+    } catch (error) {
+      if (round === 0) {
+        // 个别服务不支持 tools 参数，降级为纯对话
+        result = await postModelChat({
+          model: aiConfig.value.model,
+          messages: chat,
+          temperature: 0.5,
+          max_tokens: 900,
+          stream: false,
+        });
+      } else {
+        throw error;
+      }
+    }
+    const message = result.choices?.[0]?.message;
+    const calls = message?.tool_calls || [];
+    if (!calls.length) {
+      const reply =
+        message?.content?.trim() || modelReply(result) || "暂时没有收到回复。";
+      return { reply, suggestions };
+    }
+    chat.push({
+      role: "assistant",
+      content: message?.content || "",
+      tool_calls: calls,
+    });
+    for (const call of calls) {
+      const name = call.function?.name || "";
+      let args: Record<string, unknown> = {};
+      try {
+        args = JSON.parse(call.function?.arguments || "{}") as Record<
+          string,
+          unknown
+        >;
+      } catch {
+        args = {};
+      }
+      const output = await executeTool(name, args, suggestions);
+      chat.push({
+        role: "tool",
+        tool_call_id: call.id,
+        content: JSON.stringify(output),
+      });
+    }
+  }
+  return {
+    reply: "这次调用的工具有点多，先到这里；需要继续随时叫我。",
+    suggestions,
+  };
+}
+function extractJsonObject(text: string): { events?: unknown[] } | null {
+  const cleaned = text.replace(/```json|```/g, "");
+  const start = cleaned.indexOf("{");
+  const end = cleaned.lastIndexOf("}");
+  if (start < 0 || end <= start) return null;
+  try {
+    return JSON.parse(cleaned.slice(start, end + 1)) as {
+      events?: unknown[];
+    };
+  } catch {
+    return null;
+  }
+}
+async function saveSuggestion(message: ChatMessage, index: number) {
+  const suggestion = message.suggestions?.[index];
+  if (!suggestion || message.saved?.[index]) return;
   events.value.push({
     id: crypto.randomUUID(),
-    title: "钉钉同步：项目进度沟通",
-    date: selectedDate.value,
-    time: "14:00",
-    category: "work",
-    tags: ["钉钉", "项目"],
-    source: "dingtalk",
+    title: suggestion.title,
+    date: suggestion.date || selectedDate.value,
+    time: suggestion.time,
+    category: suggestion.category,
+    tags: [...new Set(suggestion.tags)],
+    source: "personal",
     done: false,
-    important: true,
-    urgent: false,
+    important: suggestion.important,
+    urgent: suggestion.urgent,
     voiceNote: "",
     reflection: "",
-    pdca: { plan: "同步项目进度和风险", do: "", check: "", act: "" },
+    pdca: { plan: "", do: "", check: "", act: "" },
   });
-  dialog.value = "";
+  if (!message.saved) message.saved = [];
+  message.saved[index] = true;
   await saveEvents();
 }
 async function askPi(text?: string) {
   const message = (text || chatText.value).trim();
   if (!message || chatBusy.value) return;
+  chatOpen.value = true;
+  if (!aiConfig.value) {
+    messages.value.push({
+      role: "assistant",
+      content:
+        "先配置一个模型 API Key 吧，下面弹窗里填好就能用。密钥只保存在这台手机的安全存储里。",
+    });
+    openAiSettings();
+    return;
+  }
   messages.value.push({ role: "user", content: message });
   chatText.value = "";
   chatBusy.value = true;
   try {
-    const response = await fetch(
-      `${import.meta.env.VITE_API_BASE_URL || ""}/api/chat`,
-      {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          message,
-          today: selectedDate.value,
-          events: events.value,
-          history: messages.value.slice(-11, -1),
-        }),
-      },
-    );
-    const result = (await response.json()) as {
-      reply?: string;
-      error?: string;
-    };
-    if (!response.ok) throw new Error(result.error || "Pi 暂时无法回复。");
-    messages.value.push({
-      role: "assistant",
-      content: result.reply || "暂时没有收到回复。",
-    });
+    const { reply, suggestions } = await runPiAgent(message);
+    const replyMessage: ChatMessage = { role: "assistant", content: reply };
+    if (suggestions.length) replyMessage.suggestions = suggestions;
+    messages.value.push(replyMessage);
+    void scrollChatToBottom();
   } catch (error) {
     messages.value.push({
       role: "assistant",
       content:
-        error instanceof Error ? error.message : "连接 Pi 失败，请检查服务端。",
+        error instanceof Error ? error.message : "连接模型失败，请稍后再试。",
     });
   } finally {
     chatBusy.value = false;
   }
 }
+async function scrollChatToBottom() {
+  await nextTick();
+  if (chatHistoryEl.value)
+    chatHistoryEl.value.scrollTop = chatHistoryEl.value.scrollHeight;
+}
+watch(() => messages.value.length, scrollChatToBottom);
+const currentTaskId = computed(
+  () => prioritizedEvents.value.find((event) => !event.done)?.id || "",
+);
 async function removeEvent(event: CalendarEvent) {
   events.value = events.value.filter((item) => item.id !== event.id);
   await saveEvents();
 }
+function openPdca(event: CalendarEvent, stage?: Step) {
+  pdcaTargetId.value = event.id;
+  pdcaForm.value = { ...event.pdca };
+  pdcaStage.value =
+    stage ||
+    (steps.find((step) => !event.pdca[step.id])?.id as Step | undefined) ||
+    "act";
+  pdcaHint.value = "";
+  dialog.value = "pdca";
+}
+function commitPdca() {
+  const event = events.value.find((item) => item.id === pdcaTargetId.value);
+  if (!event) return;
+  event.pdca = { ...pdcaForm.value };
+  void saveEvents();
+}
+function closePdca() {
+  commitPdca();
+  dialog.value = "";
+}
+function pdcaNext() {
+  commitPdca();
+  const order = steps.map((step) => step.id);
+  const index = order.indexOf(pdcaStage.value);
+  pdcaStage.value = order[Math.min(index + 1, order.length - 1)];
+}
+async function recordRoutineVoice(field: "name" | "prompt") {
+  if (routineListening.value) {
+    stopVoice();
+    routineListening.value = null;
+    return;
+  }
+  routineListening.value = field;
+  try {
+    const transcript = await transcribe();
+    if (transcript) {
+      const current =
+        field === "name"
+          ? routineForm.value.name
+          : routineForm.value.prompt;
+      const merged = current ? `${current} ${transcript}` : transcript;
+      if (field === "name") routineForm.value.name = merged;
+      else routineForm.value.prompt = merged;
+    }
+  } catch (error) {
+    routineError.value =
+      error instanceof Error ? error.message : "语音识别失败，请重试。";
+  } finally {
+    routineListening.value = null;
+  }
+}
+async function recordPdcaVoice() {
+  if (listening.value) {
+    stopVoice();
+    return;
+  }
+  listening.value = true;
+  try {
+    const transcript = await transcribe();
+    if (transcript) {
+      const current = pdcaForm.value[pdcaStage.value];
+      pdcaForm.value[pdcaStage.value] = current
+        ? `${current} ${transcript}`
+        : transcript;
+    }
+  } catch (error) {
+    pdcaHint.value =
+      error instanceof Error ? error.message : "语音识别失败，请再试一次。";
+  } finally {
+    listening.value = false;
+  }
+}
+const ROUTINE_NOTIF_BASE = 9100;
+const firingRoutines = new Set<string>();
+async function callRoutineModel(routine: Routine): Promise<string> {
+  const result = await postModelChat({
+    model: aiConfig.value!.model,
+    messages: [
+      {
+        role: "system",
+        content:
+          "你是定时内容助手。按用户的固定指令生成当天内容，用简体中文纯文本直接输出内容本身，不要任何解释或前后缀。",
+      },
+      { role: "user", content: `今天是 ${today.value}。固定指令：${routine.prompt}` },
+    ],
+    temperature: 0.8,
+    max_tokens: 1500,
+    stream: false,
+  });
+  const reply = result.choices?.[0]?.message?.content?.trim() || "";
+  if (!reply) throw new Error("暂时没有收到回复。");
+  return reply;
+}
+function markRoutineFired(id: string) {
+  routineFired.value[id] = today.value;
+  saveFiredMap(routineFired.value);
+}
+async function fireRoutine(routine: Routine) {
+  if (firingRoutines.has(routine.id) || !aiConfig.value) return;
+  firingRoutines.add(routine.id);
+  try {
+    const result = await callRoutineModel(routine);
+    markRoutineFired(routine.id);
+    messages.value.push({
+      role: "assistant",
+      content: `【${routine.name} ${routine.time}】\n${result}`,
+    });
+    chatOpen.value = true;
+    void scrollChatToBottom();
+  } catch (error) {
+    markRoutineFired(routine.id);
+    messages.value.push({
+      role: "assistant",
+      content: `【${routine.name}】生成失败：${
+        error instanceof Error ? error.message : "请稍后重试。"
+      }`,
+    });
+    chatOpen.value = true;
+  } finally {
+    firingRoutines.delete(routine.id);
+  }
+}
+function checkDueRoutines() {
+  const now = new Date();
+  const nowHM = `${String(now.getHours()).padStart(2, "0")}:${String(now.getMinutes()).padStart(2, "0")}`;
+  for (const routine of routines.value)
+    if (isDue(routine, nowHM, routineFired.value[routine.id], today.value))
+      void fireRoutine(routine);
+}
+async function syncRoutineNotifications() {
+  if (!Capacitor.isNativePlatform()) return;
+  try {
+    const permission = await LocalNotifications.checkPermissions();
+    if (permission.display !== "granted") {
+      const requested = await LocalNotifications.requestPermissions();
+      if (requested.display !== "granted") return;
+    }
+    for (const item of (await LocalNotifications.getPending()).notifications)
+      if (item.id >= ROUTINE_NOTIF_BASE)
+        await LocalNotifications.cancel({ notifications: [{ id: item.id }] });
+    const notifications = routines.value
+      .filter((routine) => routine.enabled)
+      .map((routine, index) => {
+        const [hour, minute] = routine.time.split(":").map(Number);
+        return {
+          id: ROUTINE_NOTIF_BASE + index,
+          title: routine.name,
+          body: "到点了，打开拾序查看今天的内容。",
+          schedule: { on: { hour, minute }, allowWhileIdle: true },
+        };
+      });
+    if (notifications.length)
+      await LocalNotifications.schedule({ notifications });
+  } catch {
+    /* 通知不可用时不阻塞应用内的定时生成 */
+  }
+}
+function openRoutines() {
+  routineForm.value = { name: "", prompt: "", time: "21:00", endTime: "" };
+  routineError.value = "";
+  dialog.value = "routines";
+}
+async function addRoutine() {
+  const name = routineForm.value.name.trim();
+  const prompt = routineForm.value.prompt.trim();
+  const time = routineForm.value.time;
+  const endTime = routineForm.value.endTime;
+  const missing: string[] = [];
+  if (!name) missing.push("名称");
+  if (!prompt) missing.push("生成指令");
+  if (!time) missing.push("开始时间");
+  if (missing.length) {
+    routineError.value = `还差：${missing.join("、")}`;
+    return;
+  }
+  if (endTime && endTime <= time) {
+    routineError.value = "结束时间需要晚于开始时间。";
+    return;
+  }
+  routines.value.push({
+    id: crypto.randomUUID(),
+    name,
+    prompt,
+    time,
+    endTime,
+    enabled: true,
+  });
+  routineForm.value = { name: "", prompt: "", time, endTime: "" };
+  routineError.value = "";
+  saveRoutines(routines.value);
+  await syncRoutineNotifications();
+}
+function toggleRoutine(routine: Routine) {
+  routine.enabled = !routine.enabled;
+  saveRoutines(routines.value);
+  void syncRoutineNotifications();
+}
+function removeRoutine(routine: Routine) {
+  routines.value = routines.value.filter((item) => item.id !== routine.id);
+  saveRoutines(routines.value);
+  void syncRoutineNotifications();
+}
+async function recordPdcaAi() {
+  if (pdcaAiListening.value) {
+    stopVoice();
+    pdcaAiListening.value = false;
+    return;
+  }
+  pdcaAiListening.value = true;
+  try {
+    const transcript = await transcribe();
+    if (transcript)
+      pdcaAiInput.value = pdcaAiInput.value
+        ? `${pdcaAiInput.value} ${transcript}`
+        : transcript;
+  } catch (error) {
+    pdcaHint.value =
+      error instanceof Error ? error.message : "语音识别失败，请再试一次。";
+  } finally {
+    pdcaAiListening.value = false;
+  }
+}
+async function runPdcaAi() {
+  if (pdcaAiBusy.value) return;
+  if (!aiConfig.value) {
+    pdcaHint.value = "先在右上角配置模型 API Key，AI 才能执行循环。";
+    return;
+  }
+  if (
+    !pdcaAiInput.value.trim() &&
+    !Object.values(pdcaForm.value).some(Boolean)
+  ) {
+    pdcaHint.value = "口述或输入今天的记录，循环才有素材。";
+    return;
+  }
+  pdcaAiBusy.value = true;
+  pdcaHint.value = "";
+  try {
+    const result = await postModelChat({
+      model: aiConfig.value.model,
+      messages: [
+        {
+          role: "system",
+          content: `你是 PDCA 执行器，不是聊天伙伴：直接执行循环、输出结果，不要提问和解释。当前事项：「${pdcaEventTitle.value}」。当前循环——计划：${pdcaForm.value.plan || "空"}；执行：${pdcaForm.value.do || "空"}；检查：${pdcaForm.value.check || "空"}；调整：${pdcaForm.value.act || "空"}。${PDCA_AI_PROMPT} 用户的记录：${pdcaAiInput.value.trim() || "（无，仅整理现有内容）"}。只输出 JSON：{"plan":"…","do":"…","check":"…","act":"…"}，值用简体中文纯文本，已经完善的内容保持原样。`,
+        },
+      ],
+      temperature: 0.5,
+      max_tokens: 900,
+      stream: false,
+    });
+    const parsed = extractJsonObject(
+      result.choices?.[0]?.message?.content?.trim() || "",
+    ) as Record<string, unknown> | null;
+    if (!parsed) throw new Error("未能解析 AI 结果，请重试。");
+    for (const stage of ["plan", "do", "check", "act"] as Step[]) {
+      const value = parsed[stage];
+      if (typeof value === "string" && value.trim())
+        pdcaForm.value[stage] = value.trim();
+    }
+    pdcaAiInput.value = "";
+    pdcaHint.value = "循环已执行，检查无误后保存。";
+  } catch (error) {
+    pdcaHint.value =
+      error instanceof Error ? error.message : "AI 处理失败，请重试。";
+  } finally {
+    pdcaAiBusy.value = false;
+  }
+}
 async function toggleDone(event: CalendarEvent) {
   event.done = !event.done;
   await saveEvents();
+  if (event.done && !event.pdca.check && !event.pdca.act) {
+    openPdca(event, "check");
+    pdcaHint.value = "事项完成，趁记忆新鲜，Check 一下结果吧。";
+  }
+  if (
+    event.done &&
+    event.tags.some((tag) => tag.startsWith("目标·"))
+  ) {
+    // 目标任务：勾选即触发费曼验收
+    chatText.value = `我完成了「${event.title}」，用费曼学习法验收我的成果`;
+    chatOpen.value = true;
+  }
+}
+function refreshToday() {
+  const key = dateKey(new Date());
+  if (key === today.value) return;
+  // 跨天回到 App（如过夜后从最近任务打开）：默认回到今天的日视图
+  today.value = key;
+  selectedDate.value = key;
+  view.value = "day";
 }
 watch(
   events,
@@ -659,6 +1959,18 @@ watch(
   { deep: true },
 );
 onMounted(() => {
+  refreshToday();
+  document.addEventListener("visibilitychange", () => {
+    if (!document.hidden) {
+      refreshToday();
+      void checkDueRoutines();
+    }
+  });
+  routines.value = loadRoutines();
+  routineFired.value = loadFiredMap();
+  loadLearningLog();
+  window.setInterval(checkDueRoutines, 20000);
+  void checkDueRoutines();
   try {
     const profile = localStorage.getItem(profileKey);
     if (profile) {
@@ -668,6 +1980,7 @@ onMounted(() => {
   } catch {
     /* 可在登录页重新输入 */
   }
+  void loadAiConfig();
   void openDatabase();
 });
 </script>
@@ -684,7 +1997,41 @@ onMounted(() => {
     </div>
     <section class="login-panel">
       <a class="brand"
-        ><span class="brand-symbol"><CalendarDays :size="18" /></span>拾序<span
+        ><span class="brand-symbol"
+          ><svg
+            viewBox="0 0 16 16"
+            width="16"
+            height="16"
+            aria-hidden="true"
+          ><rect
+            x="1.5"
+            y="1.5"
+            width="13"
+            height="13"
+            rx="3.2"
+            fill="#FCFAF1"
+          /><rect
+            x="4.2"
+            y="4.4"
+            width="4.6"
+            height="1.7"
+            rx="0.85"
+            fill="#E28B71"
+          /><rect
+            x="4.2"
+            y="7.1"
+            width="5.6"
+            height="1.7"
+            rx="0.85"
+            fill="#46563C"
+          /><rect
+            x="4.2"
+            y="9.8"
+            width="3.4"
+            height="1.7"
+            rx="0.85"
+            fill="#46563C"
+          /></svg></span>拾序<span
           class="brand-dot"
           >.</span
         ></a
@@ -712,7 +2059,41 @@ onMounted(() => {
   <div v-else class="app-shell">
     <header class="topbar">
       <a class="brand"
-        ><span class="brand-symbol"><CalendarDays :size="18" /></span>拾序<span
+        ><span class="brand-symbol"
+          ><svg
+            viewBox="0 0 16 16"
+            width="16"
+            height="16"
+            aria-hidden="true"
+          ><rect
+            x="1.5"
+            y="1.5"
+            width="13"
+            height="13"
+            rx="3.2"
+            fill="#FCFAF1"
+          /><rect
+            x="4.2"
+            y="4.4"
+            width="4.6"
+            height="1.7"
+            rx="0.85"
+            fill="#E28B71"
+          /><rect
+            x="4.2"
+            y="7.1"
+            width="5.6"
+            height="1.7"
+            rx="0.85"
+            fill="#46563C"
+          /><rect
+            x="4.2"
+            y="9.8"
+            width="3.4"
+            height="1.7"
+            rx="0.85"
+            fill="#46563C"
+          /></svg></span>拾序<span
           class="brand-dot"
           >.</span
         ></a
@@ -720,13 +2101,6 @@ onMounted(() => {
       <div class="topbar-right">
         <span class="db-indicator"></span
         ><span class="db-label">{{ database }}</span
-        ><button
-          class="top-icon"
-          title="钉钉接入"
-          aria-label="钉钉接入"
-          @click="dialog = 'dingtalk'"
-        >
-          <CloudDownload :size="18" /></button
         ><span class="profile-chip">{{ name.slice(0, 1) }}</span
         ><button
           class="top-icon"
@@ -775,7 +2149,11 @@ onMounted(() => {
           <p>每天进步一点点，<br />就是很好的节奏。</p>
         </div>
       </aside>
-      <section class="calendar-main">
+      <section
+        class="calendar-main"
+        @touchstart.passive="onMainTouchStart"
+        @touchend.passive="onMainTouchEnd"
+      >
         <div class="calendar-heading">
           <div>
             <span class="eyebrow">{{
@@ -783,36 +2161,205 @@ onMounted(() => {
                 ? "YOUR YEAR"
                 : view === "month"
                   ? "YOUR MONTH"
-                  : "YOUR DAY"
+                  : view === "week"
+                    ? "YOUR WEEK"
+                    : "YOUR DAY"
             }}</span>
-            <h1>{{ title }}</h1>
-            <p>工作、兴趣、计划，所有事项都有归属。</p>
+            <h1>
+              <template v-if="view === 'day'">
+                <span v-if="selectedDate === today" class="today-flag"
+                  >今天</span
+                >
+                <button v-else class="back-today" @click="goDay(today)">
+                  回到今天</button
+                >
+              </template>
+              {{ title }}
+            </h1>
+            <p v-if="view === 'day'" class="lunar-line">
+              农历{{ selectedDayMeta.lunarText
+              }}<template v-if="selectedDayMeta.special">
+                · {{ selectedDayMeta.special }}</template
+              ><template v-if="selectedDayMeta.rest"> · 休</template>
+              <template v-else-if="selectedDayMeta.work"> · 班</template>
+            </p>
+            <p v-else>工作、兴趣、计划，所有事项都有归属。</p>
           </div>
           <div class="heading-actions">
-            <div class="view-switch">
+            <button
+              v-show="view === 'day'"
+              class="month-jump"
+              @click="view = 'week'"
+            >
+              <CalendarDays :size="14" />周历
+            </button>
+            <div
+              v-if="view !== 'day'"
+              class="view-switch sub-switch"
+            >
               <button
-                :class="{ chosen: view === 'year' }"
-                @click="view = 'year'"
+                :class="{ chosen: view === 'week' }"
+                @click="view = 'week'"
               >
-                年</button
+                周</button
               ><button
                 :class="{ chosen: view === 'month' }"
                 @click="view = 'month'"
               >
                 月</button
               ><button
+                :class="{ chosen: view === 'year' }"
+                @click="view = 'year'"
+              >
+                年
+              </button>
+            </div>
+            <div class="view-switch">
+              <button
                 :class="{ chosen: view === 'day' }"
                 @click="view = 'day'"
               >
-                日
+                日</button
+              ><button
+                :class="{ chosen: view === 'week' }"
+                @click="view = 'week'"
+              >
+                周</button
+              ><button
+                :class="{ chosen: view === 'month' }"
+                @click="view = 'month'"
+              >
+                月</button
+              ><button
+                :class="{ chosen: view === 'year' }"
+                @click="view = 'year'"
+              >
+                年
               </button>
             </div>
-            <button class="primary-button" @click="newEvent()">
-              <Plus :size="17" />新建事项
-            </button>
           </div>
         </div>
+        <div id="pi" class="omnibar">
+          <span class="omnibar-mark"><Sparkles :size="15" /></span>
+          <input
+            v-model="chatText"
+            maxlength="2000"
+            enterkeyhint="send"
+            :placeholder="
+              aiConfig
+                ? '告诉 Pi：新事项、记录、提问…'
+                : '配置模型后，告诉 Pi 你想安排什么'
+            "
+            aria-label="告诉 Pi"
+            @focus="chatOpen = true"
+            @keydown.enter.prevent="askPi()"
+          /><button
+            type="button"
+            class="chat-voice"
+            :class="{ recording: chatListening }"
+            :aria-label="chatListening ? '停止语音' : '语音输入'"
+            @click="toggleChatVoice()"
+          >
+            <Mic :size="16" /></button
+          ><button
+            type="button"
+            class="omnibar-go"
+            aria-label="发送"
+            :disabled="!chatText.trim() || chatBusy"
+            @click="askPi()"
+          >
+            <Send :size="15" />
+          </button>
+        </div>
+        <section v-if="chatOpen" class="chat-card">
+          <header class="chat-card-head">
+            <span class="pi-avatar"><Sparkles :size="14" /></span>
+            <strong>Pi · 私人助理</strong>
+            <button class="model-label" @click.stop="openAiSettings">
+              <Settings :size="12" />{{
+                aiConfig ? providerInfo(aiConfig.provider).label : "未配置"
+              }}
+            </button>
+            <button
+              class="chat-collapse"
+              aria-label="收起对话"
+              @click="chatOpen = false"
+            >
+              <X :size="14" />
+            </button>
+          </header>
+          <div v-if="messages.length" ref="chatHistoryEl" class="chat-history">
+            <div
+              v-for="(message, index) in messages"
+              :key="index"
+              class="chat-message"
+              :class="message.role"
+            >
+              <span v-if="message.role === 'assistant'" class="chat-mark"
+                ><Sparkles :size="13"
+              /></span>
+              <div class="chat-body">
+                <p>{{ message.content }}</p>
+                <div
+                  v-if="message.suggestions?.length"
+                  class="chat-save-list"
+                >
+                  <button
+                    v-for="(suggestion, suggestionIndex) in message.suggestions"
+                    :key="suggestionIndex"
+                    type="button"
+                    class="chat-save"
+                    :class="{ saved: message.saved?.[suggestionIndex] }"
+                    :disabled="message.saved?.[suggestionIndex]"
+                    @click="saveSuggestion(message, suggestionIndex)"
+                  >
+                    <Check
+                      v-if="message.saved?.[suggestionIndex]"
+                      :size="11" /><Plus v-else :size="11" />{{
+                      message.saved?.[suggestionIndex]
+                        ? "已加入日历"
+                        : suggestion.date === selectedDate
+                          ? `${suggestion.title} ${suggestion.time}`
+                          : `${suggestion.title} ${suggestion.date.slice(5)} ${suggestion.time}`
+                    }}
+                  </button>
+                </div>
+              </div>
+            </div>
+            <div v-if="chatBusy" class="chat-message assistant">
+              <span class="chat-mark"><Sparkles :size="13" /></span>
+              <p>正在想一想…</p>
+            </div>
+          </div>
+          <div v-else class="chat-suggestions">
+            <button @click="askPi('根据我今天的事项，帮我排一下优先级。')">
+              帮我安排今天 <ArrowRight :size="13" /></button
+            ><button @click="askPi('用费曼学习法检验我今天学到的东西。')">
+              费曼检验今天所学 <ArrowRight :size="13" /></button
+            ><button @click="askPi('结合我的 PDCA 记录，帮我回顾一下。')">
+              回顾 PDCA <ArrowRight :size="13" /></button
+            ><button @click="askPi('我是不是把计划排得太满了？')">
+              计划是不是太满？ <ArrowRight :size="13" />
+            </button>
+          </div>
+          </section>
         <section class="calendar-panel">
+          <div
+            v-if="habitSignals.length"
+            class="habit-alert"
+            role="status"
+            @click="askHabitSignals()"
+          >
+            <span class="habit-alert-mark">⚠</span>
+            <span class="habit-alert-text"
+              >{{ habitSignals[0].message
+              }}{{
+                habitSignals.length > 1
+                  ? ` 等 ${habitSignals.length} 个信号`
+                  : ""
+              }}</span
+            ><span class="habit-alert-act">让 Pi 看看 ›</span>
+          </div>
           <div class="calendar-toolbar">
             <div class="period-nav">
               <button aria-label="上一个" @click="changePeriod(-1)">
@@ -824,7 +2371,9 @@ onMounted(() => {
                   ? year
                   : view === "month"
                     ? `${year}年${month + 1}月`
-                    : selectedDate
+                    : view === "week"
+                      ? weekTitle
+                      : selectedDate
               }}</strong
               ><button class="today-button" @click="goDay(today)">今天</button>
             </div>
@@ -891,6 +2440,15 @@ onMounted(() => {
                 @click="goDay(day.key)"
               >
                 <span class="day-number">{{ day.day }}</span
+                ><i v-if="day.meta.rest" class="day-flag rest">休</i
+                ><i v-else-if="day.meta.work" class="day-flag work">班</i
+                ><span
+                  class="lunar-tag"
+                  :class="{
+                    festival: day.meta.kind === 'festival',
+                    term: day.meta.kind === 'term',
+                  }"
+                  >{{ day.meta.label }}</span
                 ><span
                   v-for="event in day.events.slice(0, 3)"
                   :key="event.id"
@@ -903,11 +2461,76 @@ onMounted(() => {
               </button>
             </div></template
           >
+          <div v-else-if="view === 'week'" class="week-view">
+            <button
+              v-for="day in weekDays"
+              :key="day.key"
+              class="week-day"
+              :class="{ today: day.key === today, selected: day.key === selectedDate }"
+              @click="goDay(day.key)"
+            >
+              <span class="week-date">
+                <strong>{{ day.key.slice(5).replace("-", "/") }}</strong>
+                <small>{{
+                  weekNames[(day.date.getDay() + 6) % 7]
+                }}</small>
+                <small
+                  class="lunar-tag"
+                  :class="{
+                    festival: day.meta.kind === 'festival',
+                    term: day.meta.kind === 'term',
+                  }"
+                  >{{ day.meta.label }}</small
+                >
+              </span>
+              <span class="week-events">
+                <span
+                  v-for="event in day.events.slice(0, 2)"
+                  :key="event.id"
+                  class="calendar-event"
+                  :class="event.category"
+                  ><i></i>{{ event.time }} {{ event.title }}</span
+                >
+                <span v-if="day.events.length > 2" class="more-items"
+                  >+{{ day.events.length - 2 }} 项</span
+                >
+                <small v-if="!day.events.length" class="week-empty"
+                  >暂无安排</small
+                >
+              </span>
+              <b v-if="day.events.length" class="week-count">{{
+                day.events.length
+              }}</b>
+            </button>
+          </div>
           <div v-else class="day-agenda">
             <div class="priority-panel">
               <div class="priority-title">
                 <span><strong>轻重缓急</strong><small>按重要性与紧急性划分</small></span>
-                <button v-if="activeQuadrant" @click="activeQuadrant = ''">显示全部</button>
+                <span class="priority-actions"
+                  ><span
+                    class="loop-status"
+                    :class="{ closed: loopStatus.reviewed > 0 }"
+                  >
+                    <span>连续 {{ loopStatus.streak }} 天</span>
+                    <span>计划 {{ loopStatus.planned }}</span>
+                    <span>完成 {{ loopStatus.done }}</span>
+                    <span :class="{ warn: loopStatus.done > 0 && loopStatus.reviewed === 0 }"
+                      >复盘 {{ loopStatus.reviewed }}</span
+                    >
+                    <span
+                      v-if="loopStatus.feynman > 0"
+                      :class="{ warn: loopStatus.done > 0 && loopStatus.feynman === 0 }"
+                      >费曼 {{ loopStatus.feynman }}</span
+                    >
+                  </span>
+                  <span
+                    v-if="goalProgress"
+                    class="streak-chip goal"
+                    >{{ goalProgress[0].replace("目标·", "") }}
+                    {{ goalProgress[1].done }}/{{ goalProgress[1].total }}</span
+                  ><button v-if="activeQuadrant" @click="activeQuadrant = ''">显示全部</button></span
+                >
               </div>
               <div class="priority-grid">
                 <button
@@ -917,53 +2540,63 @@ onMounted(() => {
                   :class="[quadrant.id, { selected: activeQuadrant === quadrant.id }]"
                   @click="activeQuadrant = activeQuadrant === quadrant.id ? '' : quadrant.id"
                 >
-                  <span><strong>{{ quadrant.title }}</strong><small>{{ quadrant.hint }}</small></span>
                   <b>{{ quadrant.events.length }}</b>
-                  <small class="quadrant-preview">{{ quadrant.events.slice(0, 2).map((event) => event.title).join(' · ') || '暂无事项' }}</small>
+                  <span><strong>{{ quadrant.title }}</strong></span>
                 </button>
               </div>
-            </div>
-            <div class="agenda-head">
-              <span>时间</span><span>事项</span><span>类别 · 标签</span
-              ><span>PDCA</span>
             </div>
             <template v-for="(event, eventIndex) in prioritizedEvents" :key="event.id">
             <div v-if="event.id === morningEvents[0]?.id" class="period-divider"><span>上午</span><small>{{ morningEvents.length }} 件事项 · 12:00 前</small></div>
             <div v-if="event.id === afternoonEvents[0]?.id" class="period-divider afternoon"><span>下午与晚上</span><small>{{ afternoonEvents.length }} 件事项 · 12:00 后</small></div>
             <article
-              class="agenda-row"
-              :class="{ done: event.done }"
+              class="task-card"
+              :class="{
+                done: event.done,
+                current: event.id === currentTaskId,
+                qi: event.important && event.urgent,
+                in_: event.important && !event.urgent,
+                ui: !event.important && event.urgent,
+                nn: !event.important && !event.urgent,
+              }"
             >
-              <button
-                class="done-toggle"
-                :class="{ checked: event.done }"
-                :aria-label="event.done ? '标记未完成' : '标记完成'"
-                @click="toggleDone(event)"
-              >
-                <Check v-if="event.done" :size="13" /></button
-              ><span class="event-time"
-                ><Clock3 :size="13" />{{ event.time }}</span
-              ><button class="event-name" @click="editEvent(event)">
-                <strong>{{ event.title }}</strong
-                ><small v-if="event.source === 'dingtalk'">钉钉</small></button
-              ><span class="event-labels"
-                ><b class="category-pill" :class="event.category">{{
-                  categoryNames[event.category]
-                }}</b
-                ><span v-for="tag in event.tags" :key="tag" class="tag-pill"
-                  >#{{ tag }}</span
-                ></span
-              ><button class="pdca-count" @click="editEvent(event)">
-                {{ Object.values(event.pdca).filter(Boolean).length }}/4 PDCA
-                <ArrowRight :size="13" /></button
-              ><button
-                class="delete-button"
-                title="删除"
-                aria-label="删除事项"
-                @click="removeEvent(event)"
-              >
-                <Trash2 :size="15" />
-              </button>
+              <div class="task-card-top">
+                <button
+                  class="done-toggle"
+                  :class="{ checked: event.done }"
+                  :aria-label="event.done ? '标记未完成' : '标记完成'"
+                  @click="toggleDone(event)"
+                >
+                  <Check v-if="event.done" :size="14" /></button
+                ><span class="event-time"
+                  ><Clock3 :size="13" />{{ event.time }}</span
+                >
+                <span class="event-labels"
+                  ><b class="category-pill" :class="event.category">{{
+                    categoryNames[event.category]
+                  }}</b
+                  ><span v-for="tag in event.tags" :key="tag" class="tag-pill"
+                    >#{{ tag }}</span
+                  ><small v-if="event.source === 'dingtalk'">钉钉</small></span
+                >
+              </div>
+              <div class="task-card-main">
+                <span class="event-name">
+                  <strong>{{ event.title }}</strong>
+                </span>
+                <span class="task-card-actions">
+                  <button class="pdca-count" @click="openPdca(event)">
+                    {{ Object.values(event.pdca).filter(Boolean).length }}/4
+                    PDCA <ArrowRight :size="13" /></button
+                  ><button
+                    class="delete-button"
+                    title="删除"
+                    aria-label="删除事项"
+                    @click="removeEvent(event)"
+                  >
+                    <Trash2 :size="15" />
+                  </button>
+                </span>
+              </div>
             </article>
             </template>
             <div v-if="!prioritizedEvents.length" class="empty-day">
@@ -971,177 +2604,27 @@ onMounted(() => {
               ><span>留白也可以是计划的一部分。</span>
               <button v-if="activeQuadrant" @click="activeQuadrant = ''">清除象限筛选</button>
             </div>
-            <button class="inline-add" @click="newEvent(selectedDate)">
-              <Plus :size="15" />添加当天事项
+            <button class="inline-add" @click="focusOmnibar()">
+              <Mic :size="15" />对 Pi 说，添加到今天
             </button>
           </div>
         </section>
 
-        <section id="pi" class="pi-panel">
-          <div class="pi-header">
-            <span class="pi-avatar"><Sparkles :size="16" /></span
-            ><span
-              ><strong>Pi · 私人助理</strong
-              ><small>聊聊任务，也聊聊今天</small></span
-            ><b class="model-label">DeepSeek</b>
-          </div>
-          <div v-if="messages.length" class="chat-history">
-            <div
-              v-for="(message, index) in messages"
-              :key="index"
-              class="chat-message"
-              :class="message.role"
-            >
-              <span v-if="message.role === 'assistant'" class="chat-mark"
-                ><Sparkles :size="13"
-              /></span>
-              <p>{{ message.content }}</p>
-            </div>
-            <div v-if="chatBusy" class="chat-message assistant">
-              <span class="chat-mark"><Sparkles :size="13" /></span>
-              <p>正在想一想…</p>
-            </div>
-          </div>
-          <div v-else class="chat-suggestions">
-            <button @click="askPi('根据我今天的事项，帮我排一下优先级。')">
-              帮我安排今天 <ArrowRight :size="13" /></button
-            ><button @click="askPi('结合我的 PDCA 记录，帮我回顾一下。')">
-              回顾 PDCA <ArrowRight :size="13" /></button
-            ><button @click="askPi('我是不是把计划排得太满了？')">
-              计划是不是太满？ <ArrowRight :size="13" />
-            </button>
-          </div>
-          <form class="chat-form" @submit.prevent="askPi()">
-            <input
-              v-model="chatText"
-              maxlength="2000"
-              placeholder="问问 Pi：今天先做哪件事？"
-              aria-label="向 Pi 提问"
-            /><button
-              type="submit"
-              aria-label="发送"
-              :disabled="!chatText.trim() || chatBusy"
-            >
-              <Send :size="16" />
-            </button>
-          </form>
-          <small class="ai-note"
-            >首次使用需要在服务端配置 DeepSeek API Key。</small
-          >
-        </section>
         <footer class="app-footer">
-          <span><i class="db-indicator"></i>{{ dbNotice || database }}</span
-          ><button @click="dialog = 'dingtalk'">
-            <CircleHelp :size="14" />钉钉接入说明
+          <span
+            :style="dbNotice ? 'color:#c46a4a;font-weight:600' : ''"
+            ><i class="db-indicator"></i>{{ dbNotice || database }}</span
+          ><button @click="openRoutines()">
+            <Clock3 :size="14" />定时服务
           </button>
+          <span class="app-version">v{{ appVersion }} · {{ buildStamp }}</span>
         </footer>
       </section>
     </div>
 
     <Transition name="fade"
       ><div
-        v-if="dialog === 'event'"
-        class="modal-backdrop"
-        @click.self="dialog = ''"
-      >
-        <section class="event-dialog" role="dialog" aria-modal="true">
-          <header class="dialog-header">
-            <div>
-              <span class="eyebrow">CALENDAR ITEM</span>
-              <h2>{{ form.id ? "编辑事项" : "新建事项" }}</h2>
-            </div>
-            <button class="close-button" aria-label="关闭" @click="dialog = ''">
-              <X :size="18" />
-            </button>
-          </header>
-          <form class="event-form" @submit.prevent="saveEvent">
-            <label class="field-label">事项名称
-              <span class="voice-input"><input v-model="form.title" required maxlength="120" placeholder="比如：练习吉他 30 分钟" /><button type="button" :class="{ recording: listening }" :aria-label="listening ? '停止录音' : '语音记录事项'" @click="listening ? stopVoice() : recordVoice('title')"><Mic :size="16" /></button></span>
-            </label>
-            <div class="field-row">
-              <label class="field-label"
-                >日期<input v-model="form.date" type="date" required /></label
-              ><label class="field-label"
-                >时间<input v-model="form.time" type="time" required
-              /></label>
-            </div>
-            <fieldset class="category-field">
-              <legend>归属类别 <b>*</b></legend>
-              <div class="category-options">
-                <button
-                  v-for="category in categories"
-                  :key="category"
-                  type="button"
-                  :class="[{ chosen: form.category === category }, category]"
-                  @click="form.category = category"
-                >
-                  <i class="category-dot" :class="category"></i
-                  >{{ categoryNames[category]
-                  }}<Check v-if="form.category === category" :size="14" />
-                </button>
-              </div>
-            </fieldset>
-            <fieldset class="priority-options">
-              <legend>轻重缓急</legend>
-              <label><input v-model="form.important" type="checkbox" />重要</label>
-              <label><input v-model="form.urgent" type="checkbox" />紧急</label>
-              <span>{{ form.important ? (form.urgent ? '重要且紧急 · 立即处理' : '重要不紧急 · 安排计划') : (form.urgent ? '紧急不重要 · 尽量委托' : '不重要不紧急 · 考虑减少') }}</span>
-            </fieldset>
-            <label class="field-label"
-              >标签 <small>至少一个，逗号分隔</small
-              ><span class="tag-input"
-                ><Tag :size="15" /><input
-                  v-model="form.tags"
-                  required
-                  placeholder="例如：运动、健康" /></span
-            ></label>
-            <section class="pdca-editor">
-              <button
-                type="button"
-                class="pdca-heading"
-                @click="pdcaOpen = !pdcaOpen"
-              >
-                <span
-                  ><strong>PDCA 循环</strong
-                  ><small>计划 · 执行 · 检查 · 调整</small></span
-                ><ChevronRight :size="16" :class="{ expanded: pdcaOpen }" />
-              </button>
-              <div v-if="pdcaOpen" class="pdca-fields">
-                <label v-for="step in steps" :key="step.id"
-                  >{{ step.label
-                  }}<textarea
-                    v-model="form.pdca[step.id]"
-                    rows="2"
-                    :placeholder="step.prompt"
-                    maxlength="600"
-                  ></textarea>
-                  <button v-if="step.id === 'plan' || step.id === 'check'" type="button" class="voice-button" :class="{ recording: listening }" @click="listening ? stopVoice() : recordVoice(step.id)"><Mic :size="14" />{{ listening ? '停止录音' : '语音记录' }}</button>
-                </label>
-                <label class="reflection-field">自我反思<textarea v-model="form.reflection" rows="3" maxlength="1000" placeholder="记录感受、收获和下次想调整的地方"></textarea><button type="button" class="voice-button" :class="{ recording: listening }" @click="listening ? stopVoice() : recordVoice('reflection')"><Mic :size="14" />{{ listening ? '停止录音' : '语音记录反思' }}</button></label>
-                <small v-if="voiceError" class="voice-error">{{ voiceError }}</small>
-                <small v-if="form.voiceNote" class="voice-saved">已保存 {{ form.voiceNote.split('\n').length }} 条语音转写</small>
-              </div>
-            </section>
-            <div class="dialog-actions">
-              <button type="button" class="cancel-button" @click="dialog = ''">
-                取消</button
-              ><button
-                type="submit"
-                class="primary-button"
-                :disabled="
-                  !form.title.trim() || !form.category || !form.tags.trim()
-                "
-              >
-                保存事项
-              </button>
-            </div>
-          </form>
-        </section>
-      </div></Transition
-    >
-    <Transition name="fade"
-      ><div
-        v-if="dialog === 'dingtalk'"
+        v-if="dialog === 'settings'"
         class="modal-backdrop"
         @click.self="dialog = ''"
       >
@@ -1156,22 +2639,309 @@ onMounted(() => {
             @click="dialog = ''"
           >
             <X :size="18" /></button
-          ><span class="ding-icon">D</span
-          ><span class="eyebrow">DINGTALK WORKSPACE</span>
-          <h2>钉钉事项，只归工作</h2>
+          ><span class="eyebrow">MODEL SETTINGS</span>
+          <h2>模型 API Key</h2>
           <p>
-            钉钉来源的事项会固定归类为“工作”，并保留来源。连接真实企业日历还需管理员配置应用凭证与服务端授权。
+            Pi 由 DeepSeek 或智谱 GLM
+            提供回答，密钥只通过 HTTPS 发送给对应模型服务。真机上保存在
+            Android 安全存储；浏览器预览仅保留在当前页面，关闭即失效。
           </p>
-          <div class="ding-rule">
-            <i class="category-dot work"></i><strong>工作</strong
-            ><span>钉钉事项不可更改分类</span>
+          <fieldset class="category-field">
+            <legend>模型服务</legend>
+            <div class="category-options">
+              <button
+                v-for="provider in aiProviderList"
+                :key="provider.id"
+                type="button"
+                :class="{ chosen: aiForm.provider === provider.id }"
+                @click="chooseProvider(provider.id)"
+              >
+                {{ provider.label
+                }}<Check
+                  v-if="aiForm.provider === provider.id"
+                  :size="14" /></button
+              >
+            </div>
+          </fieldset>
+          <label class="field-label"
+            >API Key <small>{{ providerInfo(aiForm.provider).note }}</small>
+            <input
+              v-model="aiForm.apiKey"
+              type="password"
+              autocomplete="off"
+              required
+              placeholder="粘贴密钥，不会显示明文"
+          /></label>
+          <label class="field-label"
+            >模型名称
+            <input
+              v-model="aiForm.model"
+              :placeholder="providerInfo(aiForm.provider).defaultModel"
+          /></label>
+          <small v-if="aiError" class="voice-error">{{ aiError }}</small>
+          <div class="dialog-actions">
+            <button
+              v-if="aiConfig"
+              type="button"
+              class="cancel-button"
+              @click="clearAiSettings"
+            >
+              清除密钥</button
+            ><button
+              type="button"
+              class="primary-button"
+              :disabled="!aiForm.apiKey.trim()"
+              @click="saveAiSettings"
+            >
+              保存密钥
+            </button>
           </div>
+        </section>
+      </div></Transition
+    >
+    <Transition name="fade"
+      ><div
+        v-if="dialog === 'pdca'"
+        class="modal-backdrop"
+        @click.self="closePdca()"
+      >
+        <section
+          class="event-dialog pdca-dialog"
+          role="dialog"
+          aria-modal="true"
+        >
           <button
-            class="primary-button demo-button"
-            @click="importDingTalkDemo"
+            class="close-button dialog-close"
+            aria-label="关闭"
+            @click="closePdca()"
           >
-            <CloudDownload :size="16" />添加钉钉演示事项</button
-          ><small>演示事项保存在当前设备。</small>
+            <X :size="18" /></button
+          ><span class="eyebrow">PDCA LOOP</span>
+          <h2 class="pdca-title">{{ pdcaEventTitle }}</h2>
+          <small v-if="pdcaHint" class="pdca-hint">{{ pdcaHint }}</small>
+          <div class="pdca-steps">
+            <button
+              v-for="step in steps"
+              :key="step.id"
+              type="button"
+              class="pdca-step"
+              :class="{
+                active: pdcaStage === step.id,
+                filled: pdcaForm[step.id].trim(),
+              }"
+              @click="pdcaStage = step.id"
+            >
+              <Check v-if="pdcaForm[step.id].trim()" :size="11" />{{
+                step.short
+              }}
+            </button>
+          </div>
+          <label class="field-label"
+            >{{ currentStep.label }}
+            <textarea
+              v-model="pdcaForm[pdcaStage]"
+              rows="3"
+              :placeholder="currentStep.prompt"
+              maxlength="600"
+            ></textarea>
+            <button
+              type="button"
+              class="voice-button"
+              :class="{ recording: listening }"
+              @click="recordPdcaVoice()"
+            >
+              <Mic :size="14" />{{ listening ? "停止录音" : "语音记录" }}</button
+          ></label>
+          <div class="pdca-ai">
+            <strong class="pdca-ai-title"
+              >口述记录，AI 执行一次完整循环</strong
+            >
+            <div class="pdca-ai-input">
+              <input
+                v-model="pdcaAiInput"
+                maxlength="500"
+                enterkeyhint="done"
+                placeholder="今天的记录：做了什么、结果如何…"
+                aria-label="PDCA 记录输入"
+              /><button
+                type="button"
+                class="chat-voice"
+                :class="{ recording: pdcaAiListening }"
+                :aria-label="pdcaAiListening ? '停止语音' : '语音输入'"
+                @click="recordPdcaAi()"
+              >
+                <Mic :size="14" /></button
+              ><button
+                type="button"
+                class="pdca-ai-go"
+                :disabled="pdcaAiBusy"
+                aria-label="执行 PDCA 循环"
+                @click="runPdcaAi()"
+              >
+                <Sparkles :size="14" />
+              </button>
+            </div>
+            <small v-if="pdcaAiBusy" class="pdca-hint">循环执行中…</small>
+          </div>
+          <div class="dialog-actions">
+            <button type="button" class="cancel-button" @click="closePdca()">
+              完成</button
+            ><button
+              v-if="pdcaStage !== 'act'"
+              type="button"
+              class="primary-button"
+              @click="pdcaNext()"
+            >
+              保存并下一阶段 <ArrowRight :size="14" /></button
+            ><button
+              v-else
+              type="button"
+              class="primary-button"
+              @click="closePdca()"
+            >
+              循环完成
+            </button>
+          </div>
+        </section>
+      </div></Transition
+    >
+    <Transition name="fade"
+      ><div
+        v-if="dialog === 'routines'"
+        class="modal-backdrop"
+        @click.self="dialog = ''"
+      >
+        <section
+          class="event-dialog routines-dialog"
+          role="dialog"
+          aria-modal="true"
+        >
+          <button
+            class="close-button dialog-close"
+            aria-label="关闭"
+            @click="dialog = ''"
+          >
+            <X :size="18" /></button
+          ><span class="eyebrow">DAILY ROUTINES</span>
+          <h2>定时服务</h2>
+          <p>
+            每天到点由 Pi 按你的指令自动生成内容并提醒（如睡前儿童故事）。
+            App 已关闭时到点只提醒，打开后当天有效时段内自动补生成。
+          </p>
+          <div v-if="routines.length" class="routine-list">
+            <div
+              v-for="routine in routines"
+              :key="routine.id"
+              class="routine-row"
+            >
+              <div class="routine-info">
+                <strong
+                  >{{ routine.name }}
+                  {{ routine.time
+                  }}<template v-if="routine.endTime"
+                    >–{{ routine.endTime }}</template
+                  ></strong
+                >
+                <small>{{ routine.prompt }}</small>
+              </div>
+              <button
+                type="button"
+                class="routine-toggle"
+                :class="{ on: routine.enabled }"
+                @click="toggleRoutine(routine)"
+              >
+                {{ routine.enabled ? "开" : "关" }}</button
+              ><button
+                type="button"
+                class="routine-del"
+                aria-label="删除"
+                @click="removeRoutine(routine)"
+              >
+                <Trash2 :size="13" />
+              </button>
+            </div>
+          </div>
+          <p v-else class="routine-empty">还没有定时任务。</p>
+          <button
+            v-if="!routines.some((routine) => routine.name.includes('复盘'))"
+            type="button"
+            class="routine-preset"
+            @click="
+              routineForm.name = '每晚复盘';
+              routineForm.prompt =
+                '回顾我今天的日历事项，逐一引导我写 Check（结果与差异）和 Act（明天怎么调整），用温和提问的方式，一次只问一件事';
+              routineForm.time = '21:30';
+            "
+            ><Sparkles :size="13" />用模板创建：每晚复盘（21:30 引导写 Check/Act）
+          </button>
+          <div class="routine-form">
+            <button
+              type="button"
+              class="ai-dictate"
+              :class="{ recording: formDictating, busy: formParsing }"
+              @click="aiDictateRoutine()"
+            >
+              <Mic :size="14" />{{
+                formDictating
+                  ? "正在听，说完点停止…"
+                  : formParsing
+                    ? "AI 识别填入中…"
+                    : "AI 听写：说一句话，自动填单"
+              }}
+            </button>
+            <label class="field-label"
+              >名称
+              <span class="voice-input"
+                ><input
+                  v-model="routineForm.name"
+                  maxlength="20"
+                  placeholder="如：儿童故事"
+                /><button
+                  type="button"
+                  class="voice-button"
+                  :class="{ recording: routineListening === 'name' }"
+                  :aria-label="routineListening === 'name' ? '停止录音' : '语音输入名称'"
+                  @click="recordRoutineVoice('name')"
+                >
+                  <Mic :size="14" /></button></span
+            ></label>
+            <label class="field-label"
+              >生成指令
+              <span class="voice-input"
+                ><input
+                  v-model="routineForm.prompt"
+                  maxlength="300"
+                  placeholder="如：生成一个 5 分钟的睡前儿童故事，主角是小兔子"
+                /><button
+                  type="button"
+                  class="voice-button"
+                  :class="{ recording: routineListening === 'prompt' }"
+                  :aria-label="routineListening === 'prompt' ? '停止录音' : '语音输入指令'"
+                  @click="recordRoutineVoice('prompt')"
+                >
+                  <Mic :size="14" /></button></span
+            ></label>
+            <div class="field-row">
+              <label class="field-label"
+                >开始时间（每天）
+                <input v-model="routineForm.time" type="time"
+              /></label>
+              <label class="field-label"
+                >结束时间 <small>过期不补</small>
+                <input v-model="routineForm.endTime" type="time"
+              /></label>
+            </div>
+            <small v-if="routineError" class="voice-error">{{
+              routineError
+            }}</small>
+            <button
+              type="button"
+              class="primary-button"
+              @click="addRoutine()"
+            >
+              <Plus :size="15" />添加每日任务
+            </button>
+          </div>
         </section>
       </div></Transition
     >
