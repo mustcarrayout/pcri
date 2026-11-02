@@ -17,6 +17,15 @@ import {
   saveRoutines,
   type Routine,
 } from "./routines";
+import {
+  clearDingTalkConfig,
+  fetchDingTalkEvents,
+  loadDingTalkConfig,
+  loadDingTalkSyncStamp,
+  persistDingTalkConfig,
+  saveDingTalkSyncStamp,
+  type DingTalkConfig,
+} from "./dingtalk";
 import { computed, nextTick, onMounted, ref, watch } from "vue";
 import {
   ArrowRight,
@@ -48,6 +57,8 @@ interface CalendarEvent {
   category: Category;
   tags: string[];
   source: "personal" | "dingtalk";
+  /** 钉钉日程的外部 ID，用于同步去重；本机创建的事件没有 */
+  externalId?: string;
   done: boolean;
   important: boolean;
   urgent: boolean;
@@ -157,7 +168,7 @@ const today = ref(dateKey(now));
 const name = ref("");
 const signedIn = ref(false);
 const events = ref<CalendarEvent[]>([]);
-const view = ref<"year" | "month" | "week" | "day">("day");
+const view = ref<"learn" | "year" | "month" | "week" | "day">("learn");
 const activeQuadrant = ref("");
 const year = ref(now.getFullYear());
 const month = ref(now.getMonth());
@@ -165,7 +176,67 @@ const selectedDate = ref(today.value);
 const database = ref("初始化日历…");
 const dbNotice = ref("");
 const db = ref<SQLiteDBConnection | null>(null);
-const dialog = ref<"settings" | "pdca" | "routines" | "">("");
+const dialog = ref<
+  "settings" | "pdca" | "routines" | "dingtalk" | "topic" | ""
+>("");
+const topicForm = ref<{
+  id: string;
+  title: string;
+  why: string;
+  useCase: string;
+  status: TopicStatus;
+  nextStep: string;
+}>({ id: "", title: "", why: "", useCase: "", status: "learning", nextStep: "" });
+function openTopicDialog(topic?: LearningTopic) {
+  topicForm.value = topic
+    ? {
+        id: topic.id,
+        title: topic.title,
+        why: topic.why,
+        useCase: topic.useCase,
+        status: topic.status,
+        nextStep: topic.nextStep,
+      }
+    : { id: "", title: "", why: "", useCase: "", status: "learning", nextStep: "" };
+  dialog.value = "topic";
+}
+function saveTopicDialog() {
+  const title = topicForm.value.title.trim().slice(0, 40);
+  if (!title) return;
+  const existing = topics.value.find((item) => item.id === topicForm.value.id);
+  if (existing) {
+    existing.title = title;
+    existing.why = topicForm.value.why.trim().slice(0, 120);
+    existing.useCase = topicForm.value.useCase.trim().slice(0, 120);
+    existing.status = topicForm.value.status;
+    existing.nextStep = topicForm.value.nextStep.trim().slice(0, 80);
+  } else {
+    topics.value.push({
+      id: crypto.randomUUID(),
+      title,
+      why: topicForm.value.why.trim().slice(0, 120),
+      useCase: topicForm.value.useCase.trim().slice(0, 120),
+      goalTag: "",
+      status: topicForm.value.status,
+      nextStep: topicForm.value.nextStep.trim().slice(0, 80),
+      createdAt: today.value,
+      evidence: [],
+    });
+  }
+  saveTopics();
+  dialog.value = "";
+}
+function deleteTopicDialog() {
+  topics.value = topics.value.filter(
+    (item) => item.id !== topicForm.value.id,
+  );
+  saveTopics();
+  dialog.value = "";
+}
+function pauseTopic(topic: LearningTopic) {
+  topic.status = "paused";
+  saveTopics();
+}
 const search = ref("");
 const messages = ref<ChatMessage[]>([]);
 const chatText = ref("");
@@ -180,6 +251,15 @@ const aiForm = ref<AiConfig>({
   model: aiProviderList[0].defaultModel,
 });
 const aiError = ref("");
+const dingConfig = ref<DingTalkConfig | null>(null);
+const dingForm = ref<DingTalkConfig>({
+  clientId: "",
+  clientSecret: "",
+  mobile: "",
+});
+const dingError = ref("");
+const dingSyncing = ref(false);
+const dingLastSyncAt = ref("");
 const pdcaTargetId = ref("");
 const pdcaStage = ref<Step>("plan");
 const pdcaForm = ref<Record<Step, string>>({
@@ -278,10 +358,14 @@ let speechRecognition: SpeechRecognitionLike | undefined;
 
 interface SpeechRecognitionLike {
   lang: string;
+  continuous: boolean;
   interimResults: boolean;
   onresult:
     | ((event: {
-        results: ArrayLike<ArrayLike<{ transcript: string }>>;
+        resultIndex: number;
+        results: ArrayLike<
+          ArrayLike<{ transcript: string }> & { isFinal: boolean }
+        >;
       }) => void)
     | null;
   onerror: (() => void) | null;
@@ -303,13 +387,15 @@ const dateTitle = computed(() =>
   }).format(new Date(`${selectedDate.value}T12:00:00`)),
 );
 const title = computed(() =>
-  view.value === "year"
-    ? `${year.value} 年`
-    : view.value === "month"
-      ? `${year.value} 年 ${month.value + 1} 月`
-      : view.value === "week"
-        ? weekTitle.value
-        : dateTitle.value,
+  view.value === "learn"
+    ? "学习"
+    : view.value === "year"
+      ? `${year.value} 年`
+      : view.value === "month"
+        ? `${year.value} 年 ${month.value + 1} 月`
+        : view.value === "week"
+          ? weekTitle.value
+          : dateTitle.value,
 );
 const selectedDayMeta = computed(() =>
   getDayMeta(new Date(`${selectedDate.value}T12:00:00`)),
@@ -518,7 +604,8 @@ async function openDatabase() {
         important INTEGER NOT NULL DEFAULT 0, urgent INTEGER NOT NULL DEFAULT 0,
         voice_note TEXT NOT NULL DEFAULT '', reflection TEXT NOT NULL DEFAULT '',
         pdca_plan TEXT NOT NULL DEFAULT '', pdca_do TEXT NOT NULL DEFAULT '',
-        pdca_check TEXT NOT NULL DEFAULT '', pdca_act TEXT NOT NULL DEFAULT ''
+        pdca_check TEXT NOT NULL DEFAULT '', pdca_act TEXT NOT NULL DEFAULT '',
+        external_id TEXT NOT NULL DEFAULT ''
       )`);
       const columns = await nativeDb.query(
         "PRAGMA table_info(calendar_events)",
@@ -531,6 +618,7 @@ async function openDatabase() {
         urgent: "INTEGER NOT NULL DEFAULT 0",
         voice_note: "TEXT NOT NULL DEFAULT ''",
         reflection: "TEXT NOT NULL DEFAULT ''",
+        external_id: "TEXT NOT NULL DEFAULT ''",
       })) {
         if (!existingColumns.has(column))
           await nativeDb.execute(
@@ -550,6 +638,7 @@ async function openDatabase() {
           row.source === "dingtalk" ? "work" : (row.category as Category),
         tags: JSON.parse(String(row.tags || "[]")) as string[],
         source: row.source === "dingtalk" ? "dingtalk" : "personal",
+        externalId: String(row.external_id || "") || undefined,
         done: Boolean(row.done),
         important: Boolean(row.important),
         urgent: Boolean(row.urgent),
@@ -590,7 +679,7 @@ async function saveEvents() {
       // 逐行 upsert，替代整表清空重写：单行失败不再丢全部数据
       for (const event of events.value)
         await db.value.run(
-          `INSERT OR REPLACE INTO calendar_events (id,title,date,time,category,tags,source,done,important,urgent,voice_note,reflection,pdca_plan,pdca_do,pdca_check,pdca_act) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+          `INSERT OR REPLACE INTO calendar_events (id,title,date,time,category,tags,source,done,important,urgent,voice_note,reflection,pdca_plan,pdca_do,pdca_check,pdca_act,external_id) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
           [
             event.id,
             event.title,
@@ -608,6 +697,7 @@ async function saveEvents() {
             event.pdca.do,
             event.pdca.check,
             event.pdca.act,
+            event.externalId || "",
           ],
         );
       const ids = events.value
@@ -707,51 +797,113 @@ function onMainTouchEnd(e: TouchEvent) {
   if (Math.abs(dx) > 60 && Math.abs(dx) > Math.abs(dy) * 1.5)
     changePeriod(dx < 0 ? 1 : -1);
 }
+// ── 长语音听写：分段连续识别，最长 3 分钟 ──
+// Android 识别器"静音即停"，长口述靠自动续段实现：说完一句自动接下一句，
+// 按停止键或到时收尾，全文拼接返回。只存文字，不保存音频。
+const MAX_VOICE_MS = 180_000;
+let voiceSession: {
+  active: boolean;
+  startedAt: number;
+  text: string;
+  timer: number;
+} | null = null;
+const voiceClock = ref("00:00");
+function voiceTick() {
+  if (!voiceSession) return;
+  const elapsed = Date.now() - voiceSession.startedAt;
+  const sec = Math.min(Math.floor(elapsed / 1000), 179);
+  voiceClock.value = `${String(Math.floor(sec / 60)).padStart(2, "0")}:${String(sec % 60).padStart(2, "0")}`;
+  if (elapsed >= MAX_VOICE_MS) endVoiceSession();
+}
+function endVoiceSession() {
+  if (!voiceSession) return;
+  voiceSession.active = false;
+  window.clearInterval(voiceSession.timer);
+  if (Capacitor.isNativePlatform()) void SpeechRecognition.stop();
+  speechRecognition?.stop();
+}
 async function transcribe(): Promise<string> {
-  if (Capacitor.isNativePlatform()) {
-    let permission = await SpeechRecognition.checkPermissions();
-    if (permission.speechRecognition !== "granted")
-      permission = await SpeechRecognition.requestPermissions();
-    if (permission.speechRecognition !== "granted")
-      throw new Error("需要麦克风和语音识别权限才能开始录音。");
-    const result = await SpeechRecognition.start({
-      language: "zh-CN",
-      maxResults: 1,
-      partialResults: false,
-      popup: true,
-    });
-    return result.matches?.[0]?.trim() || "";
+  if (voiceSession) {
+    // 已在听写中：这次调用视为"停止"
+    endVoiceSession();
+    return "";
   }
-  const speechWindow = window as SpeechWindow;
-  const Recognition =
-    speechWindow.SpeechRecognition || speechWindow.webkitSpeechRecognition;
-  if (!Recognition) throw new Error("当前环境不支持语音识别，请直接输入。");
-  return await new Promise<string>((resolve, reject) => {
-    const recognition = new Recognition();
-    speechRecognition = recognition;
-    let settled = false;
-    const finish = (settle: () => void) => {
-      if (settled) return;
-      settled = true;
-      settle();
-    };
-    recognition.lang = "zh-CN";
-    recognition.interimResults = false;
-    recognition.onresult = (event) => {
-      const transcript = Array.from(event.results)
-        .map((result) => result[0]?.transcript || "")
-        .join("")
-        .trim();
-      finish(() => resolve(transcript));
-    };
-    recognition.onerror = () =>
-      finish(() => reject(new Error("没有识别到语音，请检查麦克风权限。")));
-    recognition.onend = () => {
-      speechRecognition = undefined;
-      finish(() => resolve(""));
-    };
-    recognition.start();
-  });
+  voiceSession = {
+    active: true,
+    startedAt: Date.now(),
+    text: "",
+    timer: window.setInterval(voiceTick, 500),
+  };
+  voiceTick();
+  let collected = "";
+  try {
+    if (Capacitor.isNativePlatform()) {
+      let permission = await SpeechRecognition.checkPermissions();
+      if (permission.speechRecognition !== "granted")
+        permission = await SpeechRecognition.requestPermissions();
+      if (permission.speechRecognition !== "granted")
+        throw new Error("需要麦克风和语音识别权限才能开始录音。");
+      let idleRetries = 0;
+      while (voiceSession?.active) {
+        try {
+          const result = await SpeechRecognition.start({
+            language: "zh-CN",
+            maxResults: 1,
+            partialResults: false,
+            popup: true,
+          });
+          idleRetries = 0;
+          const piece = result.matches?.[0]?.trim();
+          if (piece && voiceSession) voiceSession.text += piece;
+        } catch {
+          // 静音超时等"无语音"错误：会话还活着就继续听，连续 3 次才收尾
+          if (!voiceSession?.active) break;
+          idleRetries += 1;
+          if (
+            idleRetries >= 3 ||
+            Date.now() - voiceSession.startedAt >= MAX_VOICE_MS
+          )
+            break;
+        }
+      }
+    } else {
+      const speechWindow = window as SpeechWindow;
+      const Recognition =
+        speechWindow.SpeechRecognition || speechWindow.webkitSpeechRecognition;
+      if (!Recognition) throw new Error("当前环境不支持语音识别，请直接输入。");
+      await new Promise<void>((resolve) => {
+        const recognition = new Recognition();
+        speechRecognition = recognition;
+        recognition.lang = "zh-CN";
+        recognition.continuous = true;
+        recognition.interimResults = false;
+        recognition.onresult = (event) => {
+          let piece = "";
+          for (let i = event.resultIndex; i < event.results.length; i += 1) {
+            const result = event.results[i];
+            if (result.isFinal) piece += result[0]?.transcript || "";
+          }
+          if (piece && voiceSession) voiceSession.text += piece;
+        };
+        recognition.onerror = () => {
+          /* 段内错误由 onend 统一决定是否续听 */
+        };
+        recognition.onend = () => {
+          if (voiceSession?.active) {
+            recognition.start();
+            return;
+          }
+          speechRecognition = undefined;
+          resolve();
+        };
+        recognition.start();
+      });
+    }
+  } finally {
+    collected = voiceSession?.text || "";
+    endVoiceSession();
+  }
+  return collected.trim();
 }
 async function toggleChatVoice() {
   if (chatListening.value) {
@@ -777,8 +929,7 @@ async function toggleChatVoice() {
   }
 }
 function stopVoice() {
-  speechRecognition?.stop();
-  if (Capacitor.isNativePlatform()) void SpeechRecognition.stop();
+  endVoiceSession();
 }
 async function loadAiConfig() {
   if (!Capacitor.isNativePlatform()) return; // 浏览器预览不落盘，密钥只在当前页面内存里
@@ -842,6 +993,109 @@ async function clearAiSettings() {
   }
   aiConfig.value = null;
   dialog.value = "";
+}
+// ── 钉钉日历同步：企业内部应用直连，只读拉取 ──
+async function bootstrapDingTalk() {
+  dingConfig.value = await loadDingTalkConfig();
+  dingLastSyncAt.value = loadDingTalkSyncStamp();
+  // 启动自动同步只发生在真机（浏览器预览凭证不落盘，走手动同步）
+  if (dingConfig.value && Capacitor.isNativePlatform())
+    void runDingTalkSync();
+}
+function openDingTalkSettings() {
+  dingForm.value = dingConfig.value
+    ? { ...dingConfig.value }
+    : { clientId: "", clientSecret: "", mobile: "" };
+  dingError.value = "";
+  dialog.value = "dingtalk";
+}
+async function saveDingTalkSettings() {
+  const config: DingTalkConfig = {
+    clientId: dingForm.value.clientId.trim(),
+    clientSecret: dingForm.value.clientSecret.trim(),
+    mobile: dingForm.value.mobile.trim(),
+  };
+  if (!config.clientId || !config.clientSecret || !config.mobile) return;
+  try {
+    await persistDingTalkConfig(config);
+  } catch {
+    dingError.value = "安全存储写入失败，请重试。";
+    return;
+  }
+  dingConfig.value = config;
+  dingError.value = "";
+  // 保存后立即试同步一次，通了才算配置成功
+  if (await runDingTalkSync()) dialog.value = "";
+}
+async function clearDingTalkSettings() {
+  await clearDingTalkConfig();
+  dingConfig.value = null;
+  dingLastSyncAt.value = "";
+  dialog.value = "";
+}
+async function runDingTalkSync(): Promise<boolean> {
+  if (dingSyncing.value) return false;
+  if (!dingConfig.value) {
+    dingError.value = "先填写钉钉企业应用凭证。";
+    return false;
+  }
+  dingSyncing.value = true;
+  dingError.value = "";
+  try {
+    const from = new Date();
+    from.setHours(0, 0, 0, 0);
+    const to = new Date();
+    to.setDate(to.getDate() + 7);
+    to.setHours(23, 59, 59, 999);
+    const remote = await fetchDingTalkEvents(dingConfig.value, from, to);
+    const remoteIds = new Set(remote.map((item) => item.externalId));
+    // 同 externalId 只更新钉钉侧字段，保留本地 done/PDCA/象限标注
+    for (const item of remote) {
+      const existing = events.value.find(
+        (event) => event.externalId === item.externalId,
+      );
+      if (existing) {
+        existing.title = item.title;
+        existing.date = item.date;
+        existing.time = item.time;
+      } else {
+        events.value.push({
+          id: crypto.randomUUID(),
+          title: item.title,
+          date: item.date,
+          time: item.time,
+          category: "work",
+          tags: ["钉钉"],
+          source: "dingtalk",
+          done: false,
+          important: false,
+          urgent: false,
+          voiceNote: "",
+          reflection: "",
+          pdca: { plan: "", do: "", check: "", act: "" },
+          externalId: item.externalId,
+        });
+      }
+    }
+    // 只镜像同步窗口：窗口内钉钉侧已消失的本地条目移除（含无外部 ID 的旧演示数据）；
+    // 窗口外的历史事件保留，避免丢掉已写的 PDCA 记录
+    const fromKey = dateKey(from);
+    const toKey = dateKey(to);
+    events.value = events.value.filter((event) => {
+      if (event.source !== "dingtalk") return true;
+      if (event.date < fromKey || event.date > toKey) return true;
+      if (!event.externalId) return false;
+      return remoteIds.has(event.externalId);
+    });
+    dingLastSyncAt.value = saveDingTalkSyncStamp();
+    return true;
+  } catch (error) {
+    dingError.value =
+      error instanceof Error ? error.message : "钉钉同步失败，请稍后再试。";
+    return false;
+  } finally {
+    dingSyncing.value = false;
+  }
 }
 function piSystemPrompt() {
   const agenda = events.value
@@ -931,7 +1185,7 @@ async function postModelChat(
 }
 // Pi 工具驱动：模型通过工具读写日历，App 本地执行；写入类操作经确认卡落库
 const PI_AGENT_PROMPT =
-  "你可以使用工具驱动这个日历应用：query_day 查询某天日程；plan_goal 把用户的目标拆解成 2-8 个颗粒度合适（每件 30-90 分钟、渐进递进）的任务写入日历，所有任务共用 goal_tag 追踪进度，完成时会用费曼检验验收；propose_event 建议新事项（生成确认卡片，用户点击后写入日历）；propose_pdca 为已有事项建议 PDCA 内容；start_feynman 用费曼学习法检验用户是否真的学会了；save_feynman_result 在检验结束时记录结果。用户完成目标任务后，主动用费曼验收推动进步。根据学习档案衔接上次的差距，推着用户有目标地进步，不要漫无目的。";
+  "你是学习教练，驾驶一个以「学习主题」为核心的 App：日历只是主题在时间里的投影。create_topic 建主题（先问清楚为什么学、在哪用）；update_topic 推进主题状态（在学→能用→能教：能脱稿讲清=能用，能用且真的用过=能教）和下一步；plan_goal 把主题拆成 2-8 个任务（每件 30-90 分钟）写入日历，共用「目标·主题名」标签；query_day 查日程；propose_event 建议新事项；propose_pdca 为事项写 PDCA；start_feynman 用费曼检验用户是否真的学会了；save_feynman_result 记录结果（自动挂到主题证据链）。你的职责是推着每个主题往前走：讲过（费曼）和用过（完成任务）才算证据，没有证据就不要说用户学会了。学习档案里上次的差距，是这次对话的起点。";
 const PI_TOOLS = [
   {
     type: "function",
@@ -1002,6 +1256,49 @@ const PI_TOOLS = [
           },
         },
         required: ["topic", "level", "gaps"],
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "create_topic",
+      description:
+        "创建学习主题（应用的核心实体）。用户表达「我想学 X /我要掌握 X」时调用；创建前先问清楚为什么学、打算在哪用——答不上来就先帮用户找一个用例，别急着建。",
+      parameters: {
+        type: "object",
+        properties: {
+          title: { type: "string", description: "主题名（简短、可辨识）" },
+          why: { type: "string", description: "为什么学，一句话" },
+          use_case: {
+            type: "string",
+            description: "打算在哪里用它，一句话",
+          },
+        },
+        required: ["title"],
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "update_topic",
+      description:
+        "更新学习主题：推进状态（在学→能用→能教）、改下一步、补为什么学/用例。证据充分时主动升级状态：能脱稿讲清=能用，能用且真的用过=能教。",
+      parameters: {
+        type: "object",
+        properties: {
+          title: { type: "string", description: "主题名或其一部分" },
+          status: {
+            type: "string",
+            enum: ["learning", "usable", "teachable", "paused"],
+            description: "learning=在学 usable=能用 teachable=能教 paused=搁置",
+          },
+          next_step: { type: "string", description: "下一步做什么" },
+          why: { type: "string", description: "为什么学" },
+          use_case: { type: "string", description: "在哪用" },
+        },
+        required: ["title"],
       },
     },
   },
@@ -1259,6 +1556,178 @@ function loadLearningLog() {
 function saveLearningLog() {
   localStorage.setItem(LEARNING_KEY, JSON.stringify(learningLog.value));
 }
+// ── 学习主题本体：App 的核心实体。日历事项是主题在时间里的投影 ──
+// 证据链只有两类行为：讲过（费曼/复述）、用过（完成关联事项 / PDCA 引用）。
+// 刻意不存留存百分比与复测间隔——主题只认行为证据，巩固靠每晚复盘里的一问。
+type TopicStatus = "learning" | "usable" | "teachable" | "paused";
+interface TopicEvidence {
+  at: string;
+  kind: "explain" | "apply";
+  note: string;
+  level?: "solid" | "shaky" | "lost";
+}
+interface LearningTopic {
+  id: string;
+  title: string;
+  why: string;
+  useCase: string;
+  goalTag: string;
+  status: TopicStatus;
+  nextStep: string;
+  createdAt: string;
+  evidence: TopicEvidence[];
+}
+const TOPICS_KEY = "shixu-topics-v1";
+const topics = ref<LearningTopic[]>([]);
+const topicStatusNames: Record<TopicStatus, string> = {
+  learning: "在学",
+  usable: "能用",
+  teachable: "能教",
+  paused: "搁置",
+};
+function loadTopics() {
+  try {
+    const parsed = JSON.parse(
+      localStorage.getItem(TOPICS_KEY) || "[]",
+    ) as LearningTopic[];
+    topics.value = Array.isArray(parsed) ? parsed : [];
+  } catch {
+    topics.value = [];
+  }
+}
+function saveTopics() {
+  localStorage.setItem(TOPICS_KEY, JSON.stringify(topics.value));
+}
+function findTopic(needle: string): LearningTopic | undefined {
+  const key = needle.trim();
+  if (!key) return undefined;
+  return (
+    topics.value.find((topic) => topic.title === key) ||
+    topics.value.find((topic) => topic.title.includes(key))
+  );
+}
+// 存量迁移：旧学习条目 + 日历里「目标·」标签 → 主题（只跑一次，幂等）
+function migrateToTopics() {
+  let changed = false;
+  try {
+    const legacy = JSON.parse(
+      localStorage.getItem("shixu-learning-items-v1") || "[]",
+    ) as {
+      topic: string;
+      learnedAt: string;
+      goalTag: string;
+      feynmanChecks: { at: string; score: number; gaps: string }[];
+      applications: string[];
+    }[];
+    for (const item of Array.isArray(legacy) ? legacy : []) {
+      if (!item.topic || findTopic(item.topic)) continue;
+      topics.value.push({
+        id: crypto.randomUUID(),
+        title: item.topic,
+        why: "",
+        useCase: "",
+        goalTag: item.goalTag || "",
+        status: "learning",
+        nextStep: "",
+        createdAt: item.learnedAt || today.value,
+        evidence: [
+          ...(item.feynmanChecks || []).map((check) => ({
+            at: check.at,
+            kind: "explain" as const,
+            note: check.gaps || "费曼讲解",
+            level:
+              check.score >= 3
+                ? ("solid" as const)
+                : check.score === 2
+                  ? ("shaky" as const)
+                  : ("lost" as const),
+          })),
+          ...(item.applications || []).map((eventId) => ({
+            at: "",
+            kind: "apply" as const,
+            note: eventId,
+          })),
+        ],
+      });
+      changed = true;
+    }
+  } catch {
+    /* 旧数据坏了就跳过 */
+  }
+  for (const event of events.value)
+    for (const tag of event.tags) {
+      if (!tag.startsWith("目标·")) continue;
+      const name = tag.replace("目标·", "");
+      if (findTopic(name)) continue;
+      topics.value.push({
+        id: crypto.randomUUID(),
+        title: name,
+        why: "",
+        useCase: "",
+        goalTag: tag,
+        status: "learning",
+        nextStep: "",
+        createdAt: event.date,
+        evidence: [],
+      });
+      changed = true;
+    }
+  if (changed) saveTopics();
+}
+function topicExplainCount(topic: LearningTopic) {
+  return topic.evidence.filter((item) => item.kind === "explain").length;
+}
+function topicApplyCount(topic: LearningTopic) {
+  return topic.evidence.filter((item) => item.kind === "apply").length;
+}
+function topicLastExplain(topic: LearningTopic) {
+  return [...topic.evidence]
+    .reverse()
+    .find((item) => item.kind === "explain");
+}
+function topicTaskStats(topic: LearningTopic) {
+  const tag = topic.goalTag || `目标·${topic.title}`;
+  const scoped = events.value.filter((event) =>
+    event.tags.some((item) => item === tag || item === topic.title),
+  );
+  if (!scoped.length) return null;
+  return {
+    done: scoped.filter((event) => event.done).length,
+    total: scoped.length,
+  };
+}
+function appendTopicEvidence(
+  topic: LearningTopic,
+  entry: TopicEvidence,
+) {
+  topic.evidence.push(entry);
+  saveTopics();
+}
+// 行为 → 证据：完成与主题相关的事项即「用过」
+function recordApplication(event: CalendarEvent) {
+  let changed = false;
+  for (const topic of topics.value) {
+    const related =
+      event.title.includes(topic.title) ||
+      event.tags.some(
+        (tag) =>
+          tag === topic.title || (topic.goalTag && tag === topic.goalTag),
+      );
+    const marker = `evt:${event.id}`;
+    if (
+      related &&
+      !topic.evidence.some((item) => item.note === marker)
+    ) {
+      topic.evidence.push({
+        at: event.date,
+        kind: "apply",
+        note: marker,
+      });
+      changed = true;
+    }
+  }
+  if (changed) saveTopics();
+}
 const levelLabels: Record<LearningCheck["level"], string> = {
   solid: "讲清楚了",
   shaky: "部分卡壳",
@@ -1416,12 +1885,87 @@ async function toolSaveFeynmanResult(args: Record<string, unknown>) {
     if (next) event.pdca.act = next;
     await saveEvents();
   }
+  const goalTag =
+    event?.tags.find((tag) => tag.startsWith("目标·")) || "";
+  let learningTopic = findTopic(topic);
+  if (!learningTopic) {
+    learningTopic = {
+      id: crypto.randomUUID(),
+      title: topic,
+      why: "",
+      useCase: "",
+      goalTag,
+      status: "learning",
+      nextStep: gaps ? `补上卡壳点：${gaps}` : "",
+      createdAt: entry.date,
+      evidence: [],
+    };
+    topics.value.push(learningTopic);
+  }
+  if (goalTag && !learningTopic.goalTag) learningTopic.goalTag = goalTag;
+  appendTopicEvidence(learningTopic, {
+    at: entry.date,
+    kind: "explain",
+    note: strengths || gaps || "费曼讲解",
+    level,
+  });
   return {
     ok: true,
     level: FEYNMAN_LEVEL_LABEL[level],
     wrote_to: event ? event.title : "学习档案（无关联事项）",
     note: "已记录。请用一句鼓励的话收尾，并结合 gaps 提醒用户下一步。",
   };
+}
+function toolCreateTopic(args: Record<string, unknown>) {
+  const title = String(args.title || "").trim().slice(0, 40);
+  if (!title) return { error: "title 必填" };
+  if (findTopic(title)) return { error: `已有相近主题「${findTopic(title)!.title}」，直接推进它即可` };
+  const topic: LearningTopic = {
+    id: crypto.randomUUID(),
+    title,
+    why: String(args.why || "").trim().slice(0, 120),
+    useCase: String(args.use_case || "").trim().slice(0, 120),
+    goalTag: "",
+    status: "learning",
+    nextStep: String(args.next_step || "").trim() || "拆第一周的任务",
+    createdAt: today.value,
+    evidence: [],
+  };
+  topics.value.push(topic);
+  saveTopics();
+  return {
+    ok: true,
+    topic: topic.title,
+    note: "已创建。接着问用户第一周想完成什么，用 plan_goal 拆成带「目标·」标签的事项落到日历。",
+  };
+}
+function toolUpdateTopic(args: Record<string, unknown>) {
+  const topic = findTopic(String(args.title || ""));
+  if (!topic) return { error: "没有找到这个学习主题" };
+  const changed: string[] = [];
+  const status = String(args.status || "") as TopicStatus;
+  if (status && status in topicStatusNames && status !== topic.status) {
+    topic.status = status;
+    changed.push(`状态→${topicStatusNames[status]}`);
+  }
+  const nextStep = String(args.next_step || "").trim();
+  if (nextStep && nextStep !== topic.nextStep) {
+    topic.nextStep = nextStep.slice(0, 80);
+    changed.push("下一步已更新");
+  }
+  const why = String(args.why || "").trim();
+  if (why && why !== topic.why) {
+    topic.why = why.slice(0, 120);
+    changed.push("为什么学已补");
+  }
+  const useCase = String(args.use_case || "").trim();
+  if (useCase && useCase !== topic.useCase) {
+    topic.useCase = useCase.slice(0, 120);
+    changed.push("用例已补");
+  }
+  if (!changed.length) return { ok: true, topic: topic.title, note: "没有需要更新的内容" };
+  saveTopics();
+  return { ok: true, topic: topic.title, changed };
 }
 async function toolUpdateEvent(args: Record<string, unknown>) {
   const needle = String(args.event_title || "").trim();
@@ -1486,6 +2030,8 @@ async function executeTool(
   if (name === "start_feynman") return await toolStartFeynman(args);
   if (name === "save_feynman_result")
     return await toolSaveFeynmanResult(args);
+  if (name === "create_topic") return toolCreateTopic(args);
+  if (name === "update_topic") return toolUpdateTopic(args);
   return { error: `未知工具 ${name}` };
 }
 async function runPiAgent(
@@ -1504,6 +2050,24 @@ async function runPiAgent(
                 }`,
             )
             .join("；")}。根据档案推着用户进步：衔接上次的差距，别让进步漫无目的。`
+        : ""
+    } ${
+      topics.value.length
+        ? `学习主题看板：${topics.value
+            .filter((topic) => topic.status !== "paused")
+            .slice(-6)
+            .map(
+              (topic) =>
+                `「${topic.title}」${topicStatusNames[topic.status]}（讲${topicExplainCount(
+                  topic,
+                )}次·用${topicApplyCount(topic)}次${
+                  topicLastExplain(topic)?.level === "shaky" ||
+                  topicLastExplain(topic)?.level === "lost"
+                    ? "·上次没讲清"
+                    : ""
+                }${topic.nextStep ? `·下一步:${topic.nextStep}` : ""}）`,
+            )
+            .join("；")}。从证据最少或最久没动的主题开始推动。`
         : ""
     } ${
       habitSignals.value.length
@@ -1742,7 +2306,18 @@ async function callRoutineModel(routine: Routine): Promise<string> {
         content:
           "你是定时内容助手。按用户的固定指令生成当天内容，用简体中文纯文本直接输出内容本身，不要任何解释或前后缀。",
       },
-      { role: "user", content: `今天是 ${today.value}。固定指令：${routine.prompt}` },
+      {
+        role: "user",
+        content: `今天是 ${today.value}。固定指令：${routine.prompt}${
+          topics.value.filter((topic) => topic.status === "learning").length
+            ? `\n\n在内容末尾带一句：最近在学 ${topics.value
+                .filter((topic) => topic.status === "learning")
+                .slice(-3)
+                .map((topic) => `「${topic.title}」`)
+                .join("、")}，睡前挑一个，两句话讲给自己听。`
+            : ""
+        }`,
+      },
     ],
     temperature: 0.8,
     max_tokens: 1500,
@@ -1930,6 +2505,7 @@ async function runPdcaAi() {
 async function toggleDone(event: CalendarEvent) {
   event.done = !event.done;
   await saveEvents();
+  if (event.done) recordApplication(event);
   if (event.done && !event.pdca.check && !event.pdca.act) {
     openPdca(event, "check");
     pdcaHint.value = "事项完成，趁记忆新鲜，Check 一下结果吧。";
@@ -1969,6 +2545,7 @@ onMounted(() => {
   routines.value = loadRoutines();
   routineFired.value = loadFiredMap();
   loadLearningLog();
+  loadTopics();
   window.setInterval(checkDueRoutines, 20000);
   void checkDueRoutines();
   try {
@@ -1981,19 +2558,29 @@ onMounted(() => {
     /* 可在登录页重新输入 */
   }
   void loadAiConfig();
-  void openDatabase();
+  void bootstrapDingTalk();
+  void openDatabase().then(() => migrateToTopics());
 });
 </script>
 
 <template>
   <main v-if="!signedIn" class="login-screen">
     <div class="login-art">
-      <div class="art-calendar">
-        <span>OCT</span
-        ><strong>{{ String(now.getDate()).padStart(2, "0") }}</strong
-        ><i></i><i></i><i></i>
+      <span class="login-eyebrow">MAKE LEARNING COUNT</span>
+      <div class="login-float">
+        <div class="login-fc">
+          <b>费曼学习法</b>
+          <span class="m"
+            ><span class="hot">讲 3</span><span>用 2</span
+            ><span class="hot">能教</span></span
+          >
+        </div>
+        <div class="login-fc f2">
+          <b>英语词根</b>
+          <span class="m"><span>讲 0</span><span>用 0</span><span>在学</span></span>
+        </div>
       </div>
-      <p>Make room for<br />what matters.</p>
+      <p>Learn it. Use it.<br />Own it.</p>
     </div>
     <section class="login-panel">
       <a class="brand"
@@ -2037,9 +2624,9 @@ onMounted(() => {
         ></a
       >
       <div class="login-copy">
-        <span class="eyebrow">YOUR PERSONAL RHYTHM</span>
-        <h1>安排事情，<br />也安排生活。</h1>
-        <p>工作、兴趣和计划，都值得有自己的位置。</p>
+        <span class="eyebrow">MAKE LEARNING COUNT</span>
+        <h1>把想学的，<br />变成学会的。</h1>
+        <p>为每个想学的东西建一个主题——讲过、用过，才算学会。</p>
       </div>
       <form class="login-form" @submit.prevent="login">
         <label for="profile-name">怎么称呼你？</label
@@ -2050,9 +2637,9 @@ onMounted(() => {
           placeholder="输入你的名字"
           autocomplete="given-name"
           required
-        /><button type="submit">进入我的日历 <ArrowRight :size="17" /></button>
+        /><button type="submit">开始我的学习 <ArrowRight :size="17" /></button>
       </form>
-      <small class="login-privacy">本机演示登录，不代表钉钉账号验证。</small>
+      <small class="login-privacy">本机登录，数据只存在你的手机上。</small>
     </section>
   </main>
 
@@ -2157,13 +2744,15 @@ onMounted(() => {
         <div class="calendar-heading">
           <div>
             <span class="eyebrow">{{
-              view === "year"
-                ? "YOUR YEAR"
-                : view === "month"
-                  ? "YOUR MONTH"
-                  : view === "week"
-                    ? "YOUR WEEK"
-                    : "YOUR DAY"
+              view === "learn"
+                ? "YOUR LEARNING"
+                : view === "year"
+                  ? "YOUR YEAR"
+                  : view === "month"
+                    ? "YOUR MONTH"
+                    : view === "week"
+                      ? "YOUR WEEK"
+                      : "YOUR DAY"
             }}</span>
             <h1>
               <template v-if="view === 'day'">
@@ -2183,9 +2772,27 @@ onMounted(() => {
               ><template v-if="selectedDayMeta.rest"> · 休</template>
               <template v-else-if="selectedDayMeta.work"> · 班</template>
             </p>
+            <p v-else-if="view === 'learn'">主题为本，日历是它的时间投影。</p>
             <p v-else>工作、兴趣、计划，所有事项都有归属。</p>
           </div>
           <div class="heading-actions">
+            <button
+              v-if="view !== 'learn'"
+              class="nav-learn"
+              @click="view = 'learn'"
+            >
+              <Sparkles :size="14" />学习
+            </button>
+            <button
+              v-else
+              class="nav-learn"
+              @click="
+                view = 'day';
+                goDay(today);
+              "
+            >
+              <CalendarDays :size="14" />今天
+            </button>
             <button
               v-show="view === 'day'"
               class="month-jump"
@@ -2246,9 +2853,11 @@ onMounted(() => {
             maxlength="2000"
             enterkeyhint="send"
             :placeholder="
-              aiConfig
-                ? '告诉 Pi：新事项、记录、提问…'
-                : '配置模型后，告诉 Pi 你想安排什么'
+              chatListening
+                ? '正在听 ' + voiceClock + ' · 再按一次结束（最长 3 分钟）'
+                : aiConfig
+                  ? '告诉 Pi：新事项、记录、提问…'
+                  : '配置模型后，告诉 Pi 你想安排什么'
             "
             aria-label="告诉 Pi"
             @focus="chatOpen = true"
@@ -2339,11 +2948,79 @@ onMounted(() => {
             ><button @click="askPi('结合我的 PDCA 记录，帮我回顾一下。')">
               回顾 PDCA <ArrowRight :size="13" /></button
             ><button @click="askPi('我是不是把计划排得太满了？')">
-              计划是不是太满？ <ArrowRight :size="13" />
+              计划是不是太满？ <ArrowRight :size="13" /></button
+            ><button @click="askPi('看看我的学习主题，帮我从证据最少的一个开始推动。')">
+              推动学习主题 <ArrowRight :size="13" />
             </button>
           </div>
           </section>
-        <section class="calendar-panel">
+        <section v-if="view === 'learn'" class="learn-wrap">
+          <div class="learn-head">
+            <span><strong>学习主题</strong><small>讲过、用过，才算学会</small></span>
+            <button class="learn-add" @click="openTopicDialog()">
+              <Plus :size="15" />新主题
+            </button>
+          </div>
+          <div v-if="topics.length" class="topic-list">
+            <article
+              v-for="topic in [...topics].reverse()"
+              :key="topic.id"
+              class="topic-card"
+              :class="topic.status"
+            >
+              <div class="topic-top">
+                <strong>{{ topic.title }}</strong>
+                <span class="topic-status">{{ topicStatusNames[topic.status] }}</span>
+                <button
+                  class="topic-edit"
+                  aria-label="编辑主题"
+                  @click="openTopicDialog(topic)"
+                >
+                  <Settings :size="13" />
+                </button>
+              </div>
+              <p v-if="topic.why || topic.useCase" class="topic-why">
+                {{ topic.why }}<template v-if="topic.useCase"> · 用在：{{ topic.useCase }}</template>
+              </p>
+              <div class="topic-evidence">
+                <span><b>{{ topicExplainCount(topic) }}</b> 讲过<template v-if="topicLastExplain(topic)"> · 最近{{ levelLabels[topicLastExplain(topic)!.level || "shaky"] }}</template></span>
+                <span><b>{{ topicApplyCount(topic) }}</b> 用过</span>
+                <span v-if="topicTaskStats(topic)"><b>{{ topicTaskStats(topic)!.done }}</b>/{{ topicTaskStats(topic)!.total }} 任务</span>
+              </div>
+              <div v-if="topic.nextStep" class="topic-next">
+                <ArrowRight :size="13" />{{ topic.nextStep }}
+              </div>
+              <div class="topic-actions">
+                <button @click="askPi(`推动我的学习主题「${topic.title}」：先看证据链，再帮我定下一步并安排到日历。`)">
+                  <Sparkles :size="13" />让 Pi 推动</button
+                ><button
+                  @click="askPi(`用费曼学习法检验我对「${topic.title}」的掌握。`)"
+                >
+                  <Mic :size="13" />讲一次</button
+                ><button
+                  v-if="topic.status !== 'paused'"
+                  aria-label="搁置主题"
+                  @click="pauseTopic(topic)"
+                >
+                  搁置</button
+                ><button
+                  v-else
+                  @click="topic.status = 'learning'; saveTopics();"
+                >
+                  恢复</button>
+              </div>
+            </article>
+          </div>
+          <div v-else class="learn-empty">
+            <Sparkles :size="26" />
+            <strong>还没有学习主题</strong>
+            <span>学之前先想清楚：为什么学、打算在哪用。</span>
+            <button class="learn-add big" @click="openTopicDialog()">
+              <Plus :size="15" />建第一个主题
+            </button>
+          </div>
+        </section>
+        <section v-else class="calendar-panel">
           <div
             v-if="habitSignals.length"
             class="habit-alert"
@@ -2393,33 +3070,76 @@ onMounted(() => {
                 view = 'month';
               "
             >
-              <strong>{{ monthNames[monthIndex - 1] }}</strong>
-              <div class="mini-event-count">
-                {{
+              <strong
+                >{{ monthNames[monthIndex - 1]
+                }}<small
+                  v-if="
+                    monthIndex === Number(today.slice(5, 7)) &&
+                    year === Number(today.slice(0, 4))
+                  "
+                  >本月</small
+                ></strong
+              >
+              <span class="yr-bars">
+                <i
+                  v-for="category in categories"
+                  :key="category"
+                  :class="
+                    events.some(
+                      (item) =>
+                        Number(item.date.slice(5, 7)) === monthIndex &&
+                        Number(item.date.slice(0, 4)) === year &&
+                        item.category === category,
+                    )
+                      ? category
+                      : ''
+                  "
+                ></i>
+              </span>
+              <span class="yr-count"
+                ><b>{{
                   events.filter(
                     (item) =>
                       Number(item.date.slice(5, 7)) === monthIndex &&
                       Number(item.date.slice(0, 4)) === year,
                   ).length
-                }}<small>项</small>
-              </div>
-              <div class="mini-dots">
-                <i
-                  v-for="category in categories"
-                  :key="category"
-                  :class="category"
-                  :style="{
-                    opacity: events.some(
-                      (item) =>
-                        Number(item.date.slice(5, 7)) === monthIndex &&
-                        item.category === category,
-                    )
-                      ? 1
-                      : 0.18,
-                  }"
-                ></i>
-              </div>
+                }}</b>
+                项</span
+              >
             </button>
+          </div>
+          <div v-if="topics.length" class="yr-summary">
+            <div class="yr-summary-head">
+              <strong>年度学习</strong>
+              <small
+                >主题 {{ topics.length }} 个 · 讲过
+                {{
+                  topics.reduce(
+                    (sum, topic) =>
+                      sum + topic.evidence.filter((item) => item.kind === "explain").length,
+                    0,
+                  )
+                }}
+                次 · 用过
+                {{
+                  topics.reduce(
+                    (sum, topic) =>
+                      sum + topic.evidence.filter((item) => item.kind === "apply").length,
+                    0,
+                  )
+                }}
+                次</small
+              >
+            </div>
+            <div class="yr-summary-chips">
+              <span
+                v-for="topic in topics.slice(-4).reverse()"
+                :key="topic.id"
+                class="t-status"
+                :class="topic.status"
+                >{{ topic.title }} · {{ topicStatusNames[topic.status] }}</span
+              >
+            </div>
           </div>
           <template v-else-if="view === 'month'"
             ><div class="week-row">
@@ -2439,25 +3159,26 @@ onMounted(() => {
                 }"
                 @click="goDay(day.key)"
               >
-                <span class="day-number">{{ day.day }}</span
-                ><i v-if="day.meta.rest" class="day-flag rest">休</i
-                ><i v-else-if="day.meta.work" class="day-flag work">班</i
-                ><span
+                <span class="day-flag-slot"
+                  ><i v-if="day.meta.rest" class="day-flag rest">休</i
+                  ><i v-else-if="day.meta.work" class="day-flag work">班</i
+                ></span>
+                <span class="day-number">{{ day.day }}</span>
+                <span
                   class="lunar-tag"
                   :class="{
                     festival: day.meta.kind === 'festival',
                     term: day.meta.kind === 'term',
                   }"
                   >{{ day.meta.label }}</span
-                ><span
-                  v-for="event in day.events.slice(0, 3)"
-                  :key="event.id"
-                  class="calendar-event"
-                  :class="event.category"
-                  ><i></i>{{ event.title }}</span
-                ><span v-if="day.events.length > 3" class="more-items"
-                  >+{{ day.events.length - 3 }} 项</span
                 >
+                <span class="cal-dots">
+                  <i
+                    v-for="event in day.events.slice(0, 3)"
+                    :key="event.id"
+                    :class="event.category"
+                  ></i>
+                </span>
               </button>
             </div></template
           >
@@ -2474,6 +3195,7 @@ onMounted(() => {
                 <small>{{
                   weekNames[(day.date.getDay() + 6) % 7]
                 }}</small>
+                <span v-if="day.key === today" class="wk-today">今天</span>
                 <small
                   class="lunar-tag"
                   :class="{
@@ -2569,33 +3291,54 @@ onMounted(() => {
                   <Check v-if="event.done" :size="14" /></button
                 ><span class="event-time"
                   ><Clock3 :size="13" />{{ event.time }}</span
-                >
-                <span class="event-labels"
+                ><span
+                  v-if="event.id === currentTaskId"
+                  class="now-chip"
+                  >进行中</span
+                ><span class="event-labels"
                   ><b class="category-pill" :class="event.category">{{
                     categoryNames[event.category]
-                  }}</b
-                  ><span v-for="tag in event.tags" :key="tag" class="tag-pill"
-                    >#{{ tag }}</span
-                  ><small v-if="event.source === 'dingtalk'">钉钉</small></span
+                  }}</b></span
                 >
               </div>
-              <div class="task-card-main">
-                <span class="event-name">
-                  <strong>{{ event.title }}</strong>
-                </span>
-                <span class="task-card-actions">
-                  <button class="pdca-count" @click="openPdca(event)">
-                    {{ Object.values(event.pdca).filter(Boolean).length }}/4
-                    PDCA <ArrowRight :size="13" /></button
-                  ><button
-                    class="delete-button"
-                    title="删除"
-                    aria-label="删除事项"
-                    @click="removeEvent(event)"
-                  >
-                    <Trash2 :size="15" />
-                  </button>
-                </span>
+              <span class="event-name">
+                <strong>{{ event.title }}</strong>
+              </span>
+              <div class="task-card-meta">
+                <span class="q-dot"
+                  ><i></i>{{
+                    event.important && event.urgent
+                      ? "重要且紧急"
+                      : event.important
+                        ? "重要不紧急"
+                        : event.urgent
+                          ? "紧急不重要"
+                          : "不紧急不紧急"
+                  }}</span
+                ><span v-for="tag in event.tags" :key="tag" class="tag-pill"
+                  >#{{ tag }}</span
+                ><small v-if="event.source === 'dingtalk'">钉钉</small>
+                <button class="pdca-count" @click="openPdca(event)">
+                  <span class="pdca-bars"
+                    ><i
+                      v-for="stepNumber in 4"
+                      :key="stepNumber"
+                      :class="{
+                        f:
+                          stepNumber <=
+                          Object.values(event.pdca).filter(Boolean).length,
+                      }"
+                  ></i></span>
+                  PDCA {{ Object.values(event.pdca).filter(Boolean).length }}/4
+                  <ArrowRight :size="13" /></button
+                ><button
+                  class="delete-button"
+                  title="删除"
+                  aria-label="删除事项"
+                  @click="removeEvent(event)"
+                >
+                  <Trash2 :size="15" />
+                </button>
               </div>
             </article>
             </template>
@@ -2614,7 +3357,10 @@ onMounted(() => {
           <span
             :style="dbNotice ? 'color:#c46a4a;font-weight:600' : ''"
             ><i class="db-indicator"></i>{{ dbNotice || database }}</span
-          ><button @click="openRoutines()">
+          ><button @click="openDingTalkSettings()">
+            <CalendarDays :size="14" />钉钉同步
+          </button>
+          <button @click="openRoutines()">
             <Clock3 :size="14" />定时服务
           </button>
           <span class="app-version">v{{ appVersion }} · {{ buildStamp }}</span>
@@ -2701,6 +3447,177 @@ onMounted(() => {
     >
     <Transition name="fade"
       ><div
+        v-if="dialog === 'topic'"
+        class="modal-backdrop"
+        @click.self="dialog = ''"
+      >
+        <section
+          class="event-dialog ding-dialog"
+          role="dialog"
+          aria-modal="true"
+        >
+          <button
+            class="close-button dialog-close"
+            aria-label="关闭"
+            @click="dialog = ''"
+          >
+            <X :size="18" /></button
+          ><span class="eyebrow">LEARNING TOPIC</span>
+          <h2>{{ topicForm.id ? "编辑主题" : "新学习主题" }}</h2>
+          <label class="field-label"
+            >在学什么
+            <input
+              v-model="topicForm.title"
+              maxlength="40"
+              placeholder="如：费曼学习法"
+          /></label>
+          <label class="field-label"
+            >为什么学 <small>一句话，学之前先想清楚</small>
+            <input
+              v-model="topicForm.why"
+              maxlength="120"
+              placeholder="如：想检验自己是不是真的学会了"
+          /></label>
+          <label class="field-label"
+            >打算在哪用 <small>没有用例就先别学</small>
+            <input
+              v-model="topicForm.useCase"
+              maxlength="120"
+              placeholder="如：每次学完新东西都用它自测一次"
+          /></label>
+          <fieldset class="category-field">
+            <legend>状态</legend>
+            <div class="category-options">
+              <button
+                v-for="(label, key) in topicStatusNames"
+                :key="key"
+                type="button"
+                :class="{ chosen: topicForm.status === key }"
+                @click="topicForm.status = key"
+              >
+                {{ label
+                }}<Check v-if="topicForm.status === key" :size="14" />
+              </button>
+            </div>
+          </fieldset>
+          <label class="field-label"
+            >下一步
+            <input
+              v-model="topicForm.nextStep"
+              maxlength="80"
+              placeholder="如：本周拆 3 个任务到日历"
+          /></label>
+          <div class="dialog-actions">
+            <button
+              v-if="topicForm.id"
+              type="button"
+              class="cancel-button"
+              @click="deleteTopicDialog"
+            >
+              删除</button
+            ><button
+              type="button"
+              class="cancel-button"
+              @click="dialog = ''"
+            >
+              取消</button
+            ><button
+              type="button"
+              class="primary-button"
+              :disabled="!topicForm.title.trim()"
+              @click="saveTopicDialog"
+            >
+              保存
+            </button>
+          </div>
+        </section>
+      </div></Transition
+    >
+    <Transition name="fade"
+      ><div
+        v-if="dialog === 'dingtalk'"
+        class="modal-backdrop"
+        @click.self="dialog = ''"
+      >
+        <section
+          class="event-dialog ding-dialog"
+          role="dialog"
+          aria-modal="true"
+        >
+          <button
+            class="close-button dialog-close"
+            aria-label="关闭"
+            @click="dialog = ''"
+          >
+            <X :size="18" /></button
+          ><span class="eyebrow">DINGTALK SYNC</span>
+          <h2>钉钉日历同步</h2>
+          <p>
+            用钉钉开放平台企业内部应用的凭证直连拉取日程（只读，不会改动钉钉里的日程）。同步今天起
+            7 天内的工作日程，按日程 ID 去重合并；密钥只保存在 Android
+            安全存储，不写入日历数据。
+          </p>
+          <label class="field-label"
+            >Client ID
+            <input
+              v-model="dingForm.clientId"
+              autocomplete="off"
+              placeholder="开放平台应用的 Client ID"
+          /></label>
+          <label class="field-label"
+            >Client Secret
+            <input
+              v-model="dingForm.clientSecret"
+              type="password"
+              autocomplete="off"
+              placeholder="粘贴密钥，不会显示明文"
+          /></label>
+          <label class="field-label"
+            >手机号 <small>用于定位你自己的钉钉账号</small>
+            <input
+              v-model="dingForm.mobile"
+              type="tel"
+              autocomplete="tel"
+              placeholder="注册钉钉的手机号"
+          /></label>
+          <small v-if="dingError" class="voice-error">{{ dingError }}</small>
+          <small v-else-if="dingLastSyncAt" class="routine-empty"
+            >上次同步：{{ dingLastSyncAt }}</small
+          >
+          <div class="dialog-actions">
+            <button
+              v-if="dingConfig"
+              type="button"
+              class="cancel-button"
+              @click="clearDingTalkSettings"
+            >
+              清除配置</button
+            ><button
+              type="button"
+              class="cancel-button"
+              :disabled="dingSyncing || !dingConfig"
+              @click="runDingTalkSync()"
+            >
+              {{ dingSyncing ? "同步中…" : "立即同步" }}</button
+            ><button
+              type="button"
+              class="primary-button"
+              :disabled="
+                dingSyncing ||
+                !dingForm.clientId.trim() ||
+                !dingForm.clientSecret.trim() ||
+                !dingForm.mobile.trim()
+              "
+              @click="saveDingTalkSettings"
+            >
+              保存并同步
+            </button>
+          </div>
+        </section>
+      </div></Transition
+    >
+    <Transition name="fade"
+      ><div
         v-if="dialog === 'pdca'"
         class="modal-backdrop"
         @click.self="closePdca()"
@@ -2750,7 +3667,9 @@ onMounted(() => {
               :class="{ recording: listening }"
               @click="recordPdcaVoice()"
             >
-              <Mic :size="14" />{{ listening ? "停止录音" : "语音记录" }}</button
+              <Mic :size="14" />{{
+                listening ? "停止录音 " + voiceClock : "语音记录"
+              }}</button
           ></label>
           <div class="pdca-ai">
             <strong class="pdca-ai-title"
@@ -2846,11 +3765,12 @@ onMounted(() => {
               </div>
               <button
                 type="button"
-                class="routine-toggle"
+                class="rt-switch"
                 :class="{ on: routine.enabled }"
+                :aria-label="routine.enabled ? '关闭定时任务' : '开启定时任务'"
                 @click="toggleRoutine(routine)"
               >
-                {{ routine.enabled ? "开" : "关" }}</button
+                <i></i></button
               ><button
                 type="button"
                 class="routine-del"
@@ -2883,7 +3803,7 @@ onMounted(() => {
             >
               <Mic :size="14" />{{
                 formDictating
-                  ? "正在听，说完点停止…"
+                  ? "正在听 " + voiceClock + "，说完点停止…"
                   : formParsing
                     ? "AI 识别填入中…"
                     : "AI 听写：说一句话，自动填单"

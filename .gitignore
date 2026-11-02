@@ -10,6 +10,10 @@
 .env
 .env.*
 !.env.example
+.dingtalk.local.json
+
+# Local agent session artifacts
+.zcode/
 
 # Logs
 *.log
@@ -20,6 +24,7 @@ pnpm-debug.log*
 # OS and editor files
 .DS_Store
 Thumbs.db
+nul
 .idea/
 .vscode/*
 !.vscode/extensions.json

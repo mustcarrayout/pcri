@@ -1,0 +1,18 @@
+{
+  "type": "design",
+  "designSystems": [],
+  "primaryDesignSystem": null,
+  "assets": {
+    "拾序全 App 重设计 · C 系统版（12 屏）": {
+      "versions": [
+        {
+          "path": "shixu-app-redesign.html",
+          "createdAt": "2026-10-31T15:45:55.999Z",
+          "status": "needs-review"
+        }
+      ]
+    }
+  },
+  "createdAt": "2026-10-31T15:45:56.000Z",
+  "updatedAt": "2026-10-31T15:45:56.000Z"
+}

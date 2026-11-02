@@ -1,0 +1,18 @@
+{
+  "type": "design",
+  "designSystems": [],
+  "primaryDesignSystem": null,
+  "assets": {
+    "拾序日视图优化 · 三方向对比": {
+      "versions": [
+        {
+          "path": "shixu-redesign.html",
+          "createdAt": "2026-10-30T14:48:34.187Z",
+          "status": "needs-review"
+        }
+      ]
+    }
+  },
+  "createdAt": "2026-10-30T14:48:34.188Z",
+  "updatedAt": "2026-10-30T14:48:34.188Z"
+}
