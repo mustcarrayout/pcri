@@ -26,7 +26,7 @@ const storageKey = "shixu-dingtalk-config-v1";
 const syncStampKey = "shixu-dingtalk-sync-v1";
 const OPENAPI_HOST = "https://api.dingtalk.com";
 const OAPI_HOST = "https://oapi.dingtalk.com";
-// 浏览器预览经 vite dev 代理转发（见 vite.config.js），避免 CORS
+// 浏览器预览经 vite dev 代理转发（见 vite.config.ts），避免 CORS
 const OPENAPI_PROXY = "/dingtalk-openapi";
 const OAPI_PROXY = "/dingtalk-oapi";
 
