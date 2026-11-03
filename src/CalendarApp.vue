@@ -54,7 +54,6 @@ import {
   resolveTeachbackResults,
   reviewSummaryText,
   scheduleCard,
-  teachbackGaps,
   todayReviewStats,
   removeKnowledgePoint,
   resumeChallenge,
@@ -2301,11 +2300,16 @@ function openReview() {
 interface ReviewFeedback {
   cardId: string;
   kind: "forgot" | "recall";
+  /** 所评卡面截断,作反馈行归属标记:反馈在下一张卡面下展示,避免误读为当前卡的间隔 */
+  cardFront: string;
   text: string;
 }
 const reviewFeedback = ref<ReviewFeedback | null>(null);
 const reviewTransition = ref("");
-const clearedStats = computed(() => todayReviewStats());
+const clearedStats = computed(() => {
+  void loopTick.value; // 模块 store 非响应式,靠 bumpLoop 失效(gradeCurrent 每次自评后触发)
+  return todayReviewStats();
+});
 /** source 锚定原文:按 sourceId 回查事件 PDCA/转录/反思;manual/无源退化为 back 首句(如实边界) */
 function sourceAnchorOf(card: ReviewCard): string {
   const backFirstSentence =
@@ -2361,10 +2365,12 @@ function gradeCurrent(grade: ReviewGrade) {
   reviewTransition.value = transition
     ? pointTransitionText(entry.pointName || "知识点", transition)
     : "";
+  const cardFront = entry.card.front.trim().slice(0, 16);
   if (grade === "recall") {
     reviewFeedback.value = {
       cardId: entry.card.id,
       kind: "recall",
+      cardFront,
       text: `${entry.card.intervalDays} 天后见`,
     };
   } else if (grade === "forgot") {
@@ -2372,6 +2378,7 @@ function gradeCurrent(grade: ReviewGrade) {
     reviewFeedback.value = {
       cardId: entry.card.id,
       kind: "forgot",
+      cardFront,
       text: recallHintText(anchor),
     };
     void fetchRecallHint(entry.card, anchor);
@@ -2391,6 +2398,12 @@ function gradeCurrent(grade: ReviewGrade) {
 const LOOP_NOTIF_BASE = 9200;
 /** 结算昨日缺口,结果以 Pi 消息呈现(冻结保护/红线暂停附选项与可点「继续」;FSD §15.3) */
 function runDailySettle() {
+  // 冻结行同样推进 challengeStreak(#17 复核补口):结算前快照连续天数,冻结后检测里程碑
+  const beforeStreaks = new Map<string, number>();
+  for (const topic of topics.value) {
+    const challenge = activeChallengeForTopic(topic.id);
+    if (challenge) beforeStreaks.set(challenge.id, challengeStreak(challenge));
+  }
   const settled = dailySettle();
   for (const item of settled) {
     if (item.paused)
@@ -2399,11 +2412,19 @@ function runDailySettle() {
         content: `挑战「${item.challenge.topicTitle}」连着两天没打卡,先帮你暂停了,连续没清零。两个走法:① 点下面「继续挑战」,从今天重新计连续,今天先做一个 2 分钟起步就行;② 直接告诉我你现在的节奏,我把每日门槛和计划重排轻一点(改门槛参数在下个版本)。`,
         resumeTopicId: item.challenge.topicId,
       });
-    else if (item.froze)
+    else if (item.froze) {
       messages.value.push({
         role: "assistant",
         content: `昨天没打卡,冻结卡替「${item.challenge.topicTitle}」保住了连续,还剩 ${item.challenge.freezesLeft} 张。`,
       });
+      const before = beforeStreaks.get(item.challenge.id);
+      if (before !== undefined)
+        pushMilestoneIfCrossed(
+          item.challenge.topicId,
+          before,
+          challengeStreak(item.challenge),
+        );
+    }
   }
   if (settled.length) bumpLoop();
 }
@@ -2925,7 +2946,7 @@ function markTeachbackMiss(message: ChatMessage, index: number) {
   item.marked = true;
   bumpLoop();
 }
-/** 教回差距动作一:加一张卡(createCard 落 draft,走既有草稿确认面板;§15.2) */
+/** 教回差距动作一:加一张卡(createCard 落 draft,走既有草稿确认面板;§15.2);无引文时背面用兜底文案 */
 function addGapCard(message: ChatMessage, index: number) {
   const draft = message.teachbackDraft;
   const item = draft?.items[index];
@@ -2937,7 +2958,7 @@ function addGapCard(message: ChatMessage, index: number) {
     sourceId: `teachback:${draft.topicId}`,
     sourceTitle: "教回差距",
     front: `讲清「${item.pointName}」`,
-    back: item.quote,
+    back: item.quote || `教回时没讲清「${item.pointName}」,重讲一次补全`,
   });
   if ("error" in result) return;
   if (!item.actions) item.actions = {};
@@ -4069,11 +4090,7 @@ onMounted(() => {
                         记一次没讲清
                       </button>
                       <div
-                        v-if="
-                          message.teachbackDraft?.applied &&
-                          !item.covered &&
-                          item.quote
-                        "
+                        v-if="message.teachbackDraft?.applied && !item.covered"
                         class="chat-teachback-actions"
                       >
                         <button
@@ -5188,7 +5205,7 @@ onMounted(() => {
               v-if="reviewFeedback"
               class="review-feedback"
               :class="reviewFeedback.kind"
-            >{{ reviewFeedback.text }}</p>
+            ><b>「{{ reviewFeedback.cardFront }}」</b>{{ reviewFeedback.text }}</p>
             <small v-if="reviewTransition" class="review-transition">{{
               reviewTransition
             }}</small>
