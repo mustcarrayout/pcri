@@ -2103,6 +2103,8 @@ function lastGapOf(topic: LearningTopic): {
   }
   return null;
 }
+/** 空下一步主题的兜底起步动作(与 Pi create_topic 默认同文案):保证每个非搁置主题恰好一枚 chip(#16 复核修正) */
+const NOW_FALLBACK_STEP = "拆第一周的任务";
 const nowItems = computed<NowItem[]>(() => {
   void loopTick.value;
   return topics.value
@@ -2110,7 +2112,7 @@ const nowItems = computed<NowItem[]>(() => {
     .map((topic) => ({
       topic,
       action: resolveNextAction(topic.id, {
-        nextStep: topic.nextStep,
+        nextStep: topic.nextStep || NOW_FALLBACK_STEP,
         lastGap: lastGapOf(topic),
       }),
     }))
@@ -2190,6 +2192,7 @@ function finishNow() {
   if (!event) return;
   event.done = true;
   void saveEvents();
+  recordApplication(event); // 微版事件完成计入「用过」证据(FSD §14 决策记录;evt:id 去重)
   if (running.topicId) {
     const challenge = activeChallengeForTopic(running.topicId);
     if (challenge) lightCheckin(challenge.id);
