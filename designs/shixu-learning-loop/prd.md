@@ -78,13 +78,13 @@
 | F1/F4 百日挑战+通知 | [#5](https://github.com/mustcarrayout/pcri/issues/5) | ✅ P0 完成(651dad5, 3bdfb26) |
 | F2 复习队列 | [#6](https://github.com/mustcarrayout/pcri/issues/6) | ✅ P0 完成(651dad5) |
 | F3 掌握地图 | [#7](https://github.com/mustcarrayout/pcri/issues/7) | ✅ P0 完成(651dad5) |
-| Pi 工具接入 | [#8](https://github.com/mustcarrayout/pcri/issues/8) | P1 |
-| 费曼教回 | [#9](https://github.com/mustcarrayout/pcri/issues/9) | P1 |
+| Pi 工具接入 | [#8](https://github.com/mustcarrayout/pcri/issues/8) | P1;设计已落盘见 fsd §6.1 |
+| 费曼教回 | [#9](https://github.com/mustcarrayout/pcri/issues/9) | P1;设计已落盘见 fsd §13 |
 | Pi 复盘+边界周报 | [#10](https://github.com/mustcarrayout/pcri/issues/10) | P1 |
 | 分享卡片 | [#11](https://github.com/mustcarrayout/pcri/issues/11) | P1 |
 | minutes 门槛+通知择一 | [#12](https://github.com/mustcarrayout/pcri/issues/12) | P1 |
-| F10 启动零摩擦 | [#16](https://github.com/mustcarrayout/pcri/issues/16) | P1(含 Pi 提示词冲突决策点) |
-| F11 反馈即引导 | [#17](https://github.com/mustcarrayout/pcri/issues/17) | P1 |
+| F10 启动零摩擦 | [#16](https://github.com/mustcarrayout/pcri/issues/16) | P1(含 Pi 提示词冲突决策点);设计已落盘见 fsd §14 |
+| F11 反馈即引导 | [#17](https://github.com/mustcarrayout/pcri/issues/17) | P1;设计已落盘见 fsd §15 |
 | FSRS 升级 | [#13](https://github.com/mustcarrayout/pcri/issues/13) | P2 |
 | 笔记级复习 | [#14](https://github.com/mustcarrayout/pcri/issues/14) | P2 |
 | §11 开放问题拍板 | [#15](https://github.com/mustcarrayout/pcri/issues/15) | 进行中 |

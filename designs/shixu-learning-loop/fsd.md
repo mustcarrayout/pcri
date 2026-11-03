@@ -197,6 +197,16 @@ draft ──用户确认──▶ active ──用户暂停──▶ suspended �
 
 离线降级:Pi 不可用时,通知走固定模板;教回、拆解、复盘入口隐藏并提示"需要 AI 服务"。
 
+### 6.1 Issue #8:Pi 三工具接入(create_challenge / draft_cards / challenge_reminder)
+
+§6 表前三行的对话流落地,一律建议制:工具只产草稿与文案,用户确认才生效。
+
+- **create_challenge**:先以 `activeChallengeForTopic` 预检单活跃冲突,再向会话回填确认卡(新增 `ChallengeSuggestion`:topicId/topicTitle/days/threshold/goalNote 草稿,挂 `ChatMessage.challengeDraft` 可选字段)。用户点确认才调 `createChallenge`(learningLoop.ts:369)落库,目标笔记存 `loop_challenge` 新列 `goal_note`(同步 `Challenge.goalNote`;旧库 PRAGMA 缺列即 ALTER,localStorage 读补空串)。不建日历事件、不写事件 PDCA。
+- **draft_cards**:两段式同名单工具——首调仅 event_title,返回截断来源文本(pdca/voiceNote/reflection,各≤400 字);复调带 cards[](≤10 张)逐张走 `createCard`(learningLoop.ts:719)落 draft。`category='work'`(钉钉)拒绝,同 §12-2 排除规则;草稿进掌握地图「Pi 起草的卡片」面板,收下/丢弃复用 `confirmCard`/`discardDraft`;主题卡加待确认徽标(接线未用的 `pendingDraftCount`)。事件页入口=注入固定请求语走 `runPiAgent`。
+- **challenge_reminder**:入参当日摘要,输出 `{title, body}`,不写库;文案本地缓存,`syncLoopNotifications`(CalendarApp.vue:1979)优先取缓存,缺失或 Pi 不可用退回现有静态模板(1995);不改时段、条数与 9200 段 ID。
+
+边界:不做 assess_teachback / frontier_report / challenge_review、提醒时段配置;卡片草稿永不由工具直接激活;不修改日历事件本体;模型密钥不经任何工具触达。
+
 ## 7. 通知规格(汇总)
 
 - As-built(P0):单条复习提醒,每日 21:00(通知 ID 9200 段,与定时服务 9100 段隔离),仅当存在活跃挑战或激活卡时安排;冻结告知与红线暂停以 App 内 Pi 消息即时呈现(不额外占通知额度)。
@@ -236,3 +246,38 @@ SQLite → localStorage 模拟;本地通知 → 不发(控制台提示);语音�
 4. **Pi 工具**(§6):P0 仅落地数据层与手动入口;`create_challenge` 目标笔记起草、`draft_cards`、`assess_teachback`、`frontier_report` 等未接入对话流,卡片草稿面板已就绪待 Pi 产出。
 5. **里程碑徽标**(§3.3):连续天数已在数据层可算(`challengeStreak`),徽标 UI 与 finished 达成标记呈现待补。
 6. **smoke 测试**:`npm run test:loop`(esbuild 打桩电容模块)35 项断言覆盖 §11 全部规则类验收。
+
+## 13. 费曼教回实现增补(P1,#9,落实 §5.4 与 §6)
+
+**流程与复用点**
+
+1. 主题卡操作区加「教回」按钮(`.topic-actions`,CalendarApp.vue:3309),复用 `transcribe()`(CalendarApp.vue:865)语音转录;转录文本连同该主题知识点清单(名+层级)作为用户消息走既有 `askPi` 通道;主题无知识点时仅提示先拆边界,不调模型。
+2. `PI_TOOLS` 注册 `assess_teachback(topic, results[{point,covered,quote}], summary)`;`executeTool` 新分支只校验、**不写库**:新增纯函数 `resolveTeachbackResults(topicId, raw)` 按主题内 UNIQUE 的知识点名(learningLoop.ts:142)解析 pointId,剔除未知名;covered 须带非空引文,否则按未覆盖处理。
+3. 评估草稿挂到回复消息(复用 suggestions 累加器与消息内按钮模式,CalendarApp.vue:101、2407、2433):覆盖项引原话呈现;「应用本次教回」→ 复用 `applyTeachback`(learningLoop.ts:683,covered 项走 `applyPointEvidence(pointId,true)`,全量 results 落 `loop_teachback`,`transcript_id` 用 `voice:<ISO>` 合成值);遗漏项呈「标摇」按钮,确认后逐条 `applyPointEvidence(pointId,false)`,状态由 §5.1 规则重算,之后 `bumpLoop()` 刷新。应用前 mastery 与 `loop_teachback` 均不变。
+
+**边界(不做)**:遗漏项绝不自动降级;不存音频、转录全文不落库(只留引文);不改日历事件本体、不写学习档案(LearningCheck)与事件 PDCA、不自动轻打卡;模型不可用或输出不可解析时零写库;「讲一次」(save_feynman_result 通路)并存,两路数据不交叉。
+
+## 14. 启动零摩擦(F10,issue #16)
+
+每个非搁置主题任意时刻恰好一个「现在就做」,来源优先级:到期复习卡 > nextStep 的 2 分钟微版 > 教回差距微动作;一次点击开始并计时。
+
+**数据**:`calendar_events` 增列 `micro TEXT NOT NULL DEFAULT ''`,走既有 ALTER 迁移循环(CalendarApp.vue:656),`CalendarEvent` 增 `micro` 字段,承载 plan_goal 每任务的 2 分钟微版;计时态仅存内存不落库。
+
+**UI**:学习视图顶部 loop-bar(CalendarApp.vue:3248)扩为常驻条,每主题一枚 chip;新增纯函数 `resolveNextAction(topicId,{nextStep,lastGap})` 与 `microStepOf(nextStep)`(首句截断 ≤40 字)落 learningLoop.ts。①有到期卡→进既有 openReview()(CalendarApp.vue:1939),不建事件不计时;②否则按微版建 category='plan'、tags=[主题名,「微版」] 的事件并计时;③learningLog 最近一条 level≠solid 且 gaps 非空→「2 分钟再讲」。事件详情展示 micro 与「先做 2 分钟」入口。结束:事件置 done→当日无打卡则 lightCheckin(kind='light',learningLoop.ts:443)→复用 openPdca(event,"do")(CalendarApp.vue:2500)定位 Do 段,提示 15 秒语音(recordPdcaVoice,CalendarApp.vue:2551)。
+
+**Pi 提示词**:系统提示(CalendarApp.vue:1228)与 create_topic 描述(CalendarApp.vue:1307)改为「最多问一个问题,且必须同时给出第一次动手任务」;create_topic schema 补声明 next_step(处理函数 CalendarApp.vue:2204 已支持);plan_goal 每任务增可选 micro(CalendarApp.vue:1413);创建成功 note(CalendarApp.vue:2213)改为告知动手任务已就绪。
+
+**边界**:计时状态不持久化、无后台提醒;复习入口不加计时与打卡联动(归 #12/#17);教回差距的加卡/排任务归 #17;手动表单不暴露 micro;work/钉钉事件不入来源。
+
+## 15. 反馈即引导(四个反馈时刻,F11 · #17,依赖 #9;P1)
+
+出处:prd F11、design-draft §6.2/6.3。四时刻全部落在既有函数/组件上,零新弹窗、零新通知额度。
+
+1. **复习自评后**(`gradeCurrent`):忘→卡下追加 source 原文一句(按 `sourceId` 回查事件 PDCA/转录/反思;manual 卡退化为 `back` 首句)+ Pi 一句话回忆线索(Pi 不可用走同模板,不阻塞翻卡);记得→显示间隔延长值(`card.intervalDays`,如"6 天后见")。清空态在现"本次完成 N 张"上补三档分布与"明天见",数据用新增纯函数 `todayReviewStats()`。
+2. **教回后**(依赖 #9 产出 assess 清单):每条差距 = 知识点名 + 引用原话陈述(`TeachbackResult.quote`,取 covered=false 条目,现类型已支持),每条配动作按钮:加一张卡(`createCard` 落 draft,走既有草稿确认)/安排 15 分钟任务/三天后再讲(后两者复用聊天建议制 `suggestions`+`saveSuggestion` 落事件,完成后经 `recordLoopCheckin` 计入挑战)。呈现不含任何分数。
+3. **结算/里程碑**:红线消息(`runDailySettle`)附降门槛选项文案与"继续"(复用 `resumeChallenge` 与 paused 徽标按钮);里程碑按 `challengeStreak` 跨 3/7/21/50/100 以一行证据变化呈现(纯函数 `milestoneHit(prev,next)`),不庆祝。
+4. **地图变化**:`applyPointEvidence` 改为返回 `{from,to}` 迁移(现 void),迁移发生在复习时于弹窗内一行轻提示,不新增弹窗/通知。
+
+反反馈铁律(全部时刻):无人格表扬、无红点倒计时、不弹窗打断、分数只对用户可见且永远与下一步动作同现。
+
+边界(不做):不新增表与通知;降门槛数据字段不做(依赖 #12);教回流程与 Pi assess 接入归 #9;知识点状态仍只由规则驱动,Pi 不自动改库。
