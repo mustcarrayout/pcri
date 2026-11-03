@@ -67,6 +67,24 @@
 | F8 | FSRS 升级 | 调度算法从 SM-2 升级为 FSRS | P2 |
 | F9 | 笔记级复习 | 整篇 PDCA 入复习队列 | P2 |
 
+**GitHub 追溯**(issues ↔ 本表,branch/commit 反向挂 issue):
+
+| 功能 | Issue | 状态 |
+| --- | --- | --- |
+| F1/F4 百日挑战+通知 | [#5](https://github.com/mustcarrayout/pcri/issues/5) | ✅ P0 完成(651dad5, 3bdfb26) |
+| F2 复习队列 | [#6](https://github.com/mustcarrayout/pcri/issues/6) | ✅ P0 完成(651dad5) |
+| F3 掌握地图 | [#7](https://github.com/mustcarrayout/pcri/issues/7) | ✅ P0 完成(651dad5) |
+| Pi 工具接入 | [#8](https://github.com/mustcarrayout/pcri/issues/8) | P1 |
+| 费曼教回 | [#9](https://github.com/mustcarrayout/pcri/issues/9) | P1 |
+| Pi 复盘+边界周报 | [#10](https://github.com/mustcarrayout/pcri/issues/10) | P1 |
+| 分享卡片 | [#11](https://github.com/mustcarrayout/pcri/issues/11) | P1 |
+| minutes 门槛+通知择一 | [#12](https://github.com/mustcarrayout/pcri/issues/12) | P1 |
+| FSRS 升级 | [#13](https://github.com/mustcarrayout/pcri/issues/13) | P2 |
+| 笔记级复习 | [#14](https://github.com/mustcarrayout/pcri/issues/14) | P2 |
+| §11 开放问题拍板 | [#15](https://github.com/mustcarrayout/pcri/issues/15) | 进行中 |
+
+看板:[拾序 · 学习闭环](https://github.com/users/mustcarrayout/projects/2) · milestone「学习闭环 v0.3」;实现与规格的差异见 fsd §12。
+
 ## 6. 模块需求要点
 
 - **F1 百日挑战**:绑定单一学习主题;门槛二选一(≥1 个完成事件 / ≥N 分钟);冻结卡 2 张、补签 24h 内 1 次、连漏 2 天暂停(Pi 询问继续或重排);里程碑 3/7/21/50/100 天,早期权重高。验收方向:从创建到 100 天的全状态流转可在离线环境闭环。
