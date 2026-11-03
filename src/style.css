@@ -368,3 +368,55 @@ body{padding:env(safe-area-inset-top) env(safe-area-inset-right) env(safe-area-i
 .week-day{padding:9px 11px}
 .month-day{min-height:60px}
 }
+
+/* ── 学习闭环:今日复习条 / 挑战徽章 / 掌握地图 / 复习卡 ── */
+.loop-bar{display:flex;align-items:center;justify-content:space-between;gap:10px;margin-bottom:12px}
+.loop-review-go{display:inline-flex;align-items:center;gap:7px;min-height:40px;padding:0 16px;border:0;border-radius:20px;background:linear-gradient(135deg,#c6e08a,#8fb554);color:#fff;font-size:13px;font-weight:600;box-shadow:0 6px 18px rgba(96,124,66,.18);cursor:pointer}
+.loop-review-go b{font-variant-numeric:tabular-nums}
+.loop-bar>small{color:#9aa196;font-size:10px}
+.topic-loop{display:flex;flex-wrap:wrap;gap:7px;margin-top:9px}
+.loop-chip{display:inline-flex;align-items:center;gap:5px;padding:4px 10px;border-radius:12px;font-size:11px}
+.loop-chip.on{color:#55703a;background:#eef4e0}
+.loop-chip.paused{color:#a85e48;background:#f8eae5}
+.loop-chip.map{color:#4d719b;background:#e9f0f8;border:0;cursor:pointer}
+.loop-chip.none{color:#79837a;background:#f0f1ed;border:1px dashed #c9cfc4;cursor:pointer}
+.loop-act{padding:4px 10px;border:1px solid #e2e6dd;border-radius:12px;background:#fff;color:#79837a;font-size:11px;cursor:pointer}
+.review-dialog{display:grid;gap:12px}
+.review-meta{color:#89996c;font-size:11px}
+.review-card{display:grid;min-height:110px;align-content:center;gap:10px;padding:18px;border-radius:12px;background:#f7f9f1;text-align:center}
+.review-front{margin:0;font-size:16px;font-weight:600;color:#263127}
+.review-back{margin:0;padding-top:10px;border-top:1px dashed #cdd6c0;color:#525c52;font-size:14px}
+.review-grades{display:grid;grid-template-columns:repeat(3,1fr);gap:8px}
+.review-grades .grade{min-height:42px;border:0;border-radius:8px;font-size:13px;font-weight:600;cursor:pointer}
+.grade.forgot{color:#a85e48;background:#f8eae5}
+.grade.fuzzy{color:#8a6d3b;background:#f7f1e3}
+.grade.recall{color:#fff;background:#7f9d50}
+.review-progress{text-align:center;color:#9aa196;font-size:10px}
+.review-empty{display:grid;place-items:center;gap:8px;padding:24px 0;color:#9aa294;text-align:center}
+.review-empty strong{color:#5c723f;font-size:14px}
+.review-empty span{font-size:11px}
+.challenge-rule{margin:0;padding:10px;border-radius:8px;background:#f4f8ea;color:#55703a;font-size:12px;line-height:1.6}
+.map-dialog{display:grid;gap:11px}
+.map-bar{height:8px;overflow:hidden;border-radius:4px;background:#eef0ea}
+.map-bar i{display:block;height:100%;border-radius:4px;background:linear-gradient(90deg,#c6e08a,#8fb554);transition:width .3s}
+.map-bar-note{color:#9aa196;font-size:10px}
+.map-points{display:grid;gap:6px}
+.map-point{display:flex;align-items:center;gap:8px;padding:8px 10px;border-radius:8px;font-size:12px}
+.map-point.dark{border:1px dashed #c9cfc4;background:transparent;color:#9aa196}
+.map-point.dark strong{color:#79837a;font-weight:500}
+.map-point.touched{border:0;background:#eef4e0;color:#55703a}
+.map-point.shaky{border:0;background:#f7f1e3;color:#8a6d3b;animation:shaky-glow 2.4s ease-in-out infinite}
+.map-point.mastered{border:0;background:linear-gradient(135deg,#c6e08a,#8fb554);color:#fff}
+.map-point-text{display:grid;flex:1;min-width:0;gap:1px}
+.map-point-text span{font-size:10px;opacity:.78}
+.map-point.mastered .map-point-text span{color:#f2f7e6}
+.map-point-del{display:grid;width:24px;height:24px;place-items:center;padding:0;border:0;border-radius:6px;color:#b3b9ae;background:transparent;cursor:pointer}
+.map-point-del:hover{color:#c46a4a;background:#fdf1ea}
+@keyframes shaky-glow{0%,100%{box-shadow:0 0 0 0 rgba(214,177,107,0)}50%{box-shadow:0 0 0 3px rgba(214,177,107,.25)}}
+.map-add{display:grid;grid-template-columns:1fr auto auto;gap:7px}
+.map-add input,.map-card-form input{min-height:36px;padding:0 10px;border:1px solid #e1e6dc;border-radius:6px;font-size:12px}
+.map-add select{min-height:36px;border:1px solid #e1e6dc;border-radius:6px;background:#fff;font-size:11px}
+.map-card-form{display:grid;gap:7px;padding-top:4px;border-top:1px dashed #e4e8df}
+.map-draft{display:flex;align-items:center;gap:8px;padding:7px 9px;border:1px dashed #b4c493;border-radius:8px;background:#f8fbef;font-size:12px}
+.map-draft span{flex:1;min-width:0;overflow:hidden;font-size:12px;text-overflow:ellipsis;white-space:nowrap}
+@media(max-width:620px){.loop-review-go{min-height:44px;font-size:14px}.map-add{grid-template-columns:1fr auto}.map-add .primary-button{grid-column:1/-1}.review-grades .grade{min-height:48px}}

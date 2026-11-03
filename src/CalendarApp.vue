@@ -18,6 +18,35 @@ import {
   type Routine,
 } from "./routines";
 import {
+  DAILY_QUEUE_LIMIT,
+  abandonChallenge,
+  activeChallengeForTopic,
+  addKnowledgePoint,
+  buildDailyQueue,
+  challengeProgress,
+  challengeStreak,
+  confirmCard,
+  createCard,
+  createChallenge,
+  dailySettle,
+  discardDraft,
+  draftCards,
+  hasLoopActivity,
+  initLoopStorage,
+  recordEventDone,
+  removeKnowledgePoint,
+  resumeChallenge,
+  scheduleCard,
+  topicMasteryPercent,
+  topicPoints,
+  type BloomLevel,
+  type Challenge,
+  type ChallengeProgress,
+  type PointStatus,
+  type QueueEntry,
+  type ReviewGrade,
+} from "./learningLoop";
+import {
   clearDingTalkConfig,
   fetchDingTalkEvents,
   loadDingTalkConfig,
@@ -29,6 +58,7 @@ import {
 import { computed, nextTick, onMounted, ref, watch } from "vue";
 import {
   ArrowRight,
+  Brain,
   CalendarDays,
   Check,
   ChevronLeft,
@@ -36,6 +66,7 @@ import {
   Clock3,
   ListChecks,
   LogOut,
+  Map as MapIcon,
   Mic,
   MessageCircle,
   Plus,
@@ -44,6 +75,7 @@ import {
   Sparkles,
   Tag,
   Trash2,
+  Trophy,
   X,
 } from "lucide-vue-next";
 
@@ -177,7 +209,15 @@ const database = ref("初始化日历…");
 const dbNotice = ref("");
 const db = ref<SQLiteDBConnection | null>(null);
 const dialog = ref<
-  "settings" | "pdca" | "routines" | "dingtalk" | "topic" | ""
+  | "settings"
+  | "pdca"
+  | "routines"
+  | "dingtalk"
+  | "topic"
+  | "review"
+  | "challenge"
+  | "map"
+  | ""
 >("");
 const topicForm = ref<{
   id: string;
@@ -1728,6 +1768,239 @@ function recordApplication(event: CalendarEvent) {
   }
   if (changed) saveTopics();
 }
+// ── 学习闭环:百日挑战 + 复习队列 + 掌握地图(designs/shixu-learning-loop/fsd.md)──
+// 数据在 learningLoop.ts(SQLite/降级 localStorage);这里接 Vue 状态与 UI。
+// 模块内 store 非 reactive,用 loopTick 触发重渲染。
+const loopTick = ref(0);
+const loopBackendName = ref("");
+const challengeForm = ref<{ topicId: string; days: number }>({ topicId: "", days: 100 });
+const mapTopicId = ref("");
+const newPointName = ref("");
+const newPointBloom = ref<BloomLevel>("recall");
+const cardForm = ref({ pointId: "", front: "", back: "" });
+const loopError = ref("");
+const queue = ref<QueueEntry[]>([]);
+const reviewIndex = ref(0);
+const showBack = ref(false);
+const reviewDoneCount = ref(0);
+
+const pointStatusNames: Record<PointStatus, string> = {
+  dark: "未探索",
+  touched: "已接触",
+  shaky: "边缘",
+  mastered: "已掌握",
+};
+const bloomNames: Record<BloomLevel, string> = {
+  recall: "能复述",
+  explain: "能解释",
+  apply: "能应用",
+  create: "能创造",
+};
+
+const mapTopic = computed(() =>
+  topics.value.find((topic) => topic.id === mapTopicId.value),
+);
+const mapPoints = computed(() => {
+  void loopTick.value;
+  return mapTopicId.value ? topicPoints(mapTopicId.value) : [];
+});
+const draftList = computed(() => {
+  void loopTick.value;
+  return draftCards();
+});
+const reviewEntry = computed(() => queue.value[reviewIndex.value] || null);
+
+function masteryPercentOf(topicId: string) {
+  void loopTick.value;
+  return topicMasteryPercent(topicId);
+}
+function challengeOf(topicId: string): Challenge | undefined {
+  void loopTick.value;
+  return activeChallengeForTopic(topicId);
+}
+function progressOf(topicId: string): ChallengeProgress | null {
+  void loopTick.value;
+  const challenge = activeChallengeForTopic(topicId);
+  return challenge ? challengeProgress(challenge) : null;
+}
+function streakOf(topicId: string) {
+  void loopTick.value;
+  const challenge = activeChallengeForTopic(topicId);
+  return challenge ? challengeStreak(challenge) : 0;
+}
+function dueCount() {
+  void loopTick.value;
+  return buildDailyQueue().length;
+}
+function bumpLoop() {
+  loopTick.value += 1;
+}
+/** 事件勾选完成时,给标题/标签能对上的主题记一次挑战打卡 */
+function recordLoopCheckin(event: CalendarEvent) {
+  for (const topic of topics.value) {
+    const related =
+      event.tags.includes(topic.title) ||
+      event.tags.some((tag) => tag === topic.goalTag) ||
+      event.title.includes(topic.title);
+    if (related) recordEventDone(topic.id, event.date, event.id);
+  }
+  bumpLoop();
+}
+function openChallengeDialog(topic: LearningTopic) {
+  challengeForm.value = { topicId: topic.id, days: 100 };
+  loopError.value = "";
+  dialog.value = "challenge";
+}
+function createChallengeForTopic() {
+  const topic = topics.value.find((item) => item.id === challengeForm.value.topicId);
+  if (!topic) return;
+  const result = createChallenge({
+    topicId: topic.id,
+    topicTitle: topic.title,
+    totalDays: challengeForm.value.days,
+  });
+  if ("error" in result) {
+    loopError.value = result.error;
+    return;
+  }
+  bumpLoop();
+  dialog.value = "";
+}
+function resumeTopicChallenge(topicId: string) {
+  const challenge = activeChallengeForTopic(topicId);
+  if (challenge) {
+    resumeChallenge(challenge.id);
+    bumpLoop();
+  }
+}
+function abandonTopicChallenge(topicId: string) {
+  const challenge = activeChallengeForTopic(topicId);
+  if (challenge) {
+    abandonChallenge(challenge.id);
+    bumpLoop();
+  }
+}
+function openMap(topic: LearningTopic) {
+  mapTopicId.value = topic.id;
+  newPointName.value = "";
+  cardForm.value = { pointId: "", front: "", back: "" };
+  loopError.value = "";
+  dialog.value = "map";
+}
+function addPointFromForm() {
+  if (!mapTopicId.value) return;
+  const result = addKnowledgePoint({
+    topicId: mapTopicId.value,
+    name: newPointName.value,
+    bloomLevel: newPointBloom.value,
+  });
+  if ("error" in result) {
+    loopError.value = result.error;
+    return;
+  }
+  newPointName.value = "";
+  loopError.value = "";
+  bumpLoop();
+}
+function removePoint(id: string) {
+  removeKnowledgePoint(id);
+  bumpLoop();
+}
+function addManualCard() {
+  const topic = mapTopic.value;
+  if (!topic) return;
+  const result = createCard({
+    topicId: topic.id,
+    pointId: cardForm.value.pointId || null,
+    sourceType: "manual",
+    sourceId: `manual:${today.value}`,
+    sourceTitle: topic.title,
+    front: cardForm.value.front,
+    back: cardForm.value.back,
+    active: true,
+  });
+  if ("error" in result) {
+    loopError.value = result.error;
+    return;
+  }
+  cardForm.value = { pointId: "", front: "", back: "" };
+  loopError.value = "";
+  bumpLoop();
+}
+function confirmDraft(id: string) {
+  confirmCard(id);
+  bumpLoop();
+}
+function discardDraftCard(id: string) {
+  discardDraft(id);
+  bumpLoop();
+}
+function openReview() {
+  queue.value = buildDailyQueue();
+  reviewIndex.value = 0;
+  showBack.value = false;
+  reviewDoneCount.value = 0;
+  dialog.value = "review";
+}
+function gradeCurrent(grade: ReviewGrade) {
+  const entry = queue.value[reviewIndex.value];
+  if (!entry) return;
+  scheduleCard(entry.card, grade);
+  reviewDoneCount.value += 1;
+  showBack.value = false;
+  if (reviewIndex.value + 1 >= queue.value.length) {
+    queue.value = [];
+    reviewIndex.value = 0;
+  } else {
+    reviewIndex.value += 1;
+  }
+  bumpLoop();
+}
+// 每日复习提醒(FSD §7:P0 单条,固定 21:00;与定时服务 9100 段分开)
+const LOOP_NOTIF_BASE = 9200;
+/** 结算昨日缺口,结果以 Pi 消息呈现(冻结保护/红线暂停) */
+function runDailySettle() {
+  const settled = dailySettle();
+  for (const item of settled) {
+    if (item.paused)
+      messages.value.push({
+        role: "assistant",
+        content: `挑战「${item.challenge.topicTitle}」连着两天没打卡,先帮你暂停了。想继续或重新安排,随时跟我说。`,
+      });
+    else if (item.froze)
+      messages.value.push({
+        role: "assistant",
+        content: `昨天没打卡,冻结卡替「${item.challenge.topicTitle}」保住了连续,还剩 ${item.challenge.freezesLeft} 张。`,
+      });
+  }
+  if (settled.length) bumpLoop();
+}
+async function syncLoopNotifications() {
+  if (!Capacitor.isNativePlatform()) return;
+  try {
+    const permission = await LocalNotifications.checkPermissions();
+    if (permission.display !== "granted") {
+      const requested = await LocalNotifications.requestPermissions();
+      if (requested.display !== "granted") return;
+    }
+    for (const item of (await LocalNotifications.getPending()).notifications)
+      if (item.id >= LOOP_NOTIF_BASE && item.id < LOOP_NOTIF_BASE + 100)
+        await LocalNotifications.cancel({ notifications: [{ id: item.id }] });
+    if (hasLoopActivity())
+      await LocalNotifications.schedule({
+        notifications: [
+          {
+            id: LOOP_NOTIF_BASE,
+            title: "拾序 · 今日复习",
+            body: "复习队列已就绪,几分钟就能清空;边缘知识点优先。",
+            schedule: { on: { hour: 21, minute: 0 }, allowWhileIdle: true },
+          },
+        ],
+      });
+  } catch {
+    /* 通知不可用不阻塞 */
+  }
+}
 const levelLabels: Record<LearningCheck["level"], string> = {
   solid: "讲清楚了",
   shaky: "部分卡壳",
@@ -2505,7 +2778,10 @@ async function runPdcaAi() {
 async function toggleDone(event: CalendarEvent) {
   event.done = !event.done;
   await saveEvents();
-  if (event.done) recordApplication(event);
+  if (event.done) {
+    recordApplication(event);
+    recordLoopCheckin(event);
+  }
   if (event.done && !event.pdca.check && !event.pdca.act) {
     openPdca(event, "check");
     pdcaHint.value = "事项完成，趁记忆新鲜，Check 一下结果吧。";
@@ -2540,6 +2816,7 @@ onMounted(() => {
     if (!document.hidden) {
       refreshToday();
       void checkDueRoutines();
+      runDailySettle(); // 跨天回到 App 时补结算昨日
     }
   });
   routines.value = loadRoutines();
@@ -2560,6 +2837,12 @@ onMounted(() => {
   void loadAiConfig();
   void bootstrapDingTalk();
   void openDatabase().then(() => migrateToTopics());
+  void initLoopStorage().then((backendName) => {
+    loopBackendName.value = backendName;
+    runDailySettle();
+    bumpLoop();
+    void syncLoopNotifications();
+  });
 });
 </script>
 
@@ -2961,6 +3244,12 @@ onMounted(() => {
               <Plus :size="15" />新主题
             </button>
           </div>
+          <div class="loop-bar">
+            <button class="loop-review-go" @click="openReview()">
+              <Brain :size="15" />今日复习<b>{{ dueCount() }}</b>张
+            </button>
+            <small>边缘优先 · 上限 {{ DAILY_QUEUE_LIMIT }} 张{{ loopBackendName ? "" : " · 存储初始化中" }}</small>
+          </div>
           <div v-if="topics.length" class="topic-list">
             <article
               v-for="topic in [...topics].reverse()"
@@ -2986,6 +3275,32 @@ onMounted(() => {
                 <span><b>{{ topicExplainCount(topic) }}</b> 讲过<template v-if="topicLastExplain(topic)"> · 最近{{ levelLabels[topicLastExplain(topic)!.level || "shaky"] }}</template></span>
                 <span><b>{{ topicApplyCount(topic) }}</b> 用过</span>
                 <span v-if="topicTaskStats(topic)"><b>{{ topicTaskStats(topic)!.done }}</b>/{{ topicTaskStats(topic)!.total }} 任务</span>
+              </div>
+              <div class="topic-loop">
+                <template v-if="challengeOf(topic.id)">
+                  <span
+                    class="loop-chip"
+                    :class="challengeOf(topic.id)!.status === 'paused' ? 'paused' : 'on'"
+                  >
+                    <Trophy :size="12" />{{ progressOf(topic.id)?.dayNumber ?? 0 }}/{{ progressOf(topic.id)?.totalDays ?? 0 }}
+                    · 连续 {{ streakOf(topic.id) }} 天
+                    <template v-if="challengeOf(topic.id)!.status === 'paused'"> · 已暂停</template>
+                  </span>
+                  <button
+                    v-if="challengeOf(topic.id)!.status === 'paused'"
+                    class="loop-act"
+                    @click="resumeTopicChallenge(topic.id)"
+                  >
+                    继续
+                  </button>
+                  <button v-else class="loop-act" @click="abandonTopicChallenge(topic.id)">放弃</button>
+                </template>
+                <button v-else class="loop-chip none" @click="openChallengeDialog(topic)">
+                  <Trophy :size="12" />发起百日挑战
+                </button>
+                <button class="loop-chip map" @click="openMap(topic)">
+                  <MapIcon :size="12" />掌握 {{ masteryPercentOf(topic.id) }}%
+                </button>
               </div>
               <div v-if="topic.nextStep" class="topic-next">
                 <ArrowRight :size="13" />{{ topic.nextStep }}
@@ -3862,6 +4177,210 @@ onMounted(() => {
               <Plus :size="15" />添加每日任务
             </button>
           </div>
+        </section>
+      </div></Transition
+    >
+    <Transition name="fade"
+      ><div
+        v-if="dialog === 'review'"
+        class="modal-backdrop"
+        @click.self="dialog = ''"
+      >
+        <section class="event-dialog review-dialog" role="dialog" aria-modal="true">
+          <button
+            class="close-button dialog-close"
+            aria-label="关闭"
+            @click="dialog = ''"
+          >
+            <X :size="18" /></button
+          ><span class="eyebrow">DAILY REVIEW</span>
+          <h2>今日复习</h2>
+          <template v-if="reviewEntry">
+            <small class="review-meta">{{
+              reviewEntry.pointName
+                ? `知识点:${reviewEntry.pointName}`
+                : reviewEntry.card.sourceTitle
+            }}</small>
+            <div class="review-card">
+              <p class="review-front">{{ reviewEntry.card.front }}</p>
+              <p v-if="showBack" class="review-back">{{ reviewEntry.card.back }}</p>
+            </div>
+            <button
+              v-if="!showBack"
+              type="button"
+              class="primary-button"
+              @click="showBack = true"
+            >
+              翻面看答案
+            </button>
+            <div v-else class="review-grades">
+              <button type="button" class="grade forgot" @click="gradeCurrent('forgot')">忘了</button>
+              <button type="button" class="grade fuzzy" @click="gradeCurrent('fuzzy')">模糊</button>
+              <button type="button" class="grade recall" @click="gradeCurrent('recall')">记得</button>
+            </div>
+            <small class="review-progress"
+              >{{ reviewIndex + 1 }} / {{ queue.length }} · 自评决定下次什么时候再见</small
+            >
+          </template>
+          <div v-else class="review-empty">
+            <Brain :size="26" />
+            <strong>{{ reviewDoneCount ? `本次完成 ${reviewDoneCount} 张` : "今日队列是空的" }}</strong>
+            <span>有限容器:今天到这里,明天再来。</span>
+          </div>
+        </section>
+      </div></Transition
+    >
+    <Transition name="fade"
+      ><div
+        v-if="dialog === 'challenge'"
+        class="modal-backdrop"
+        @click.self="dialog = ''"
+      >
+        <section class="event-dialog ding-dialog" role="dialog" aria-modal="true">
+          <button
+            class="close-button dialog-close"
+            aria-label="关闭"
+            @click="dialog = ''"
+          >
+            <X :size="18" /></button
+          ><span class="eyebrow">LEARNING CHALLENGE</span>
+          <h2>发起学习挑战</h2>
+          <p>
+            把学习装进时间容器:周期一定结束。自带 2
+            张冻结卡(漏卡自动保连续),连漏两天才暂停,永不清零。
+          </p>
+          <fieldset class="category-field">
+            <legend>周期</legend>
+            <div class="category-options">
+              <button
+                v-for="days in [21, 30, 66, 100]"
+                :key="days"
+                type="button"
+                :class="{ chosen: challengeForm.days === days }"
+                @click="challengeForm.days = days"
+              >
+                {{ days }} 天<Check v-if="challengeForm.days === days" :size="14" />
+              </button>
+            </div>
+          </fieldset>
+          <p class="challenge-rule">
+            每日门槛:当天完成至少 1
+            个该主题的事项。勾选完成即自动打卡;实在没学,也可以第二天补一张轻打卡。
+          </p>
+          <small v-if="loopError" class="voice-error">{{ loopError }}</small>
+          <div class="dialog-actions">
+            <button type="button" class="cancel-button" @click="dialog = ''">取消</button>
+            <button type="button" class="primary-button" @click="createChallengeForTopic()">
+              开始挑战
+            </button>
+          </div>
+        </section>
+      </div></Transition
+    >
+    <Transition name="fade"
+      ><div
+        v-if="dialog === 'map'"
+        class="modal-backdrop"
+        @click.self="dialog = ''"
+      >
+        <section class="event-dialog map-dialog" role="dialog" aria-modal="true">
+          <button
+            class="close-button dialog-close"
+            aria-label="关闭"
+            @click="dialog = ''"
+          >
+            <X :size="18" /></button
+          ><span class="eyebrow">MASTERY MAP</span>
+          <h2>{{ mapTopic?.title || "掌握地图" }}</h2>
+          <div class="map-bar">
+            <i :style="{ width: `${masteryPercentOf(mapTopicId)}%` }"></i>
+          </div>
+          <small class="map-bar-note"
+            >掌握 {{ masteryPercentOf(mapTopicId) }}% · 只数「边缘」以上,接触过不算学会</small
+          >
+          <div v-if="mapPoints.length" class="map-points">
+            <div
+              v-for="point in mapPoints"
+              :key="point.id"
+              class="map-point"
+              :class="point.status"
+            >
+              <div class="map-point-text">
+                <strong>{{ point.name }}</strong>
+                <span>{{ bloomNames[point.bloomLevel] }} · {{ pointStatusNames[point.status] }}</span>
+              </div>
+              <button
+                type="button"
+                class="map-point-del"
+                aria-label="删除知识点"
+                @click="removePoint(point.id)"
+              >
+                <Trash2 :size="12" />
+              </button>
+            </div>
+          </div>
+          <p v-else class="routine-empty">
+            还没有知识点。先拆边界:这个主题里,哪些是你还说不清的?
+          </p>
+          <div class="map-add">
+            <input
+              v-model="newPointName"
+              maxlength="40"
+              placeholder="新知识点,如:p 值的含义"
+              @keydown.enter.prevent="addPointFromForm()"
+            /><select
+              :value="newPointBloom"
+              aria-label="掌握层级"
+              @change="
+                newPointBloom = ($event.target as HTMLSelectElement).value as BloomLevel
+              "
+            >
+              <option value="recall">能复述</option>
+              <option value="explain">能解释</option>
+              <option value="apply">能应用</option>
+              <option value="create">能创造</option>
+            </select>
+            <button type="button" class="primary-button" aria-label="添加知识点" @click="addPointFromForm()">
+              <Plus :size="14" />
+            </button>
+          </div>
+          <div class="map-card-form">
+            <strong class="pdca-ai-title">加一张复习卡</strong>
+            <input
+              v-model="cardForm.front"
+              maxlength="200"
+              placeholder="正面:提示或问题"
+            /><input
+              v-model="cardForm.back"
+              maxlength="500"
+              placeholder="背面:答案或展开"
+            /><button
+              type="button"
+              class="primary-button"
+              :disabled="!cardForm.front.trim() || !cardForm.back.trim()"
+              @click="addManualCard()"
+            >
+              加入复习队列
+            </button>
+          </div>
+          <template v-if="draftList.length">
+            <strong class="pdca-ai-title">Pi 起草的卡片({{ draftList.length }})</strong>
+            <div v-for="draft in draftList" :key="draft.id" class="map-draft">
+              <span>{{ draft.front }}</span>
+              <button type="button" class="chat-save" @click="confirmDraft(draft.id)">
+                <Check :size="11" />收下
+              </button>
+              <button
+                type="button"
+                class="map-point-del"
+                aria-label="丢弃草稿"
+                @click="discardDraftCard(draft.id)"
+              >
+                <X :size="11" />
+              </button>
+            </div>
+          </template>
+          <small v-if="loopError" class="voice-error">{{ loopError }}</small>
         </section>
       </div></Transition
     >
