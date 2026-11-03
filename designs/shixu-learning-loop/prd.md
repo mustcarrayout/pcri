@@ -44,6 +44,8 @@
 4. **宽容的失败观**:冻结卡、不清零;复习忘掉不惩罚,只重排。
 5. **成果可见边界**:亮区与暗区同等呈现;用推进叙事替代总分叙事。
 6. **一切皆有限容器**:每个交互单元可完成、可收尾;拒绝无限信息流式设计。
+7. **启动零摩擦**(2026-11-03 增补,design-draft §六):从"想学"到"动手"只隔一个动作;每主题常驻唯一"现在就做",任务带 2 分钟微版。
+8. **反馈即引导**:反馈必答三问(到哪了/怎么样/下一步),终点是可点击的动作,不是句号;不做人格表扬与焦虑设计。
 
 ## 4. 用户故事
 
@@ -66,6 +68,8 @@
 | F7 | 分享卡片 | 打卡卡片本地渲染导出 | P1 |
 | F8 | FSRS 升级 | 调度算法从 SM-2 升级为 FSRS | P2 |
 | F9 | 笔记级复习 | 整篇 PDCA 入复习队列 | P2 |
+| F10 | 启动零摩擦 | 常驻"现在就做"、任务微版、启动即计时、Pi 先动手后校准 | P1 |
+| F11 | 反馈即引导 | 四个反馈时刻落点:自评微引导、教回差距动作化、结算选项化、地图轻提示 | P1 |
 
 **GitHub 追溯**(issues ↔ 本表,branch/commit 反向挂 issue):
 
@@ -79,6 +83,8 @@
 | Pi 复盘+边界周报 | [#10](https://github.com/mustcarrayout/pcri/issues/10) | P1 |
 | 分享卡片 | [#11](https://github.com/mustcarrayout/pcri/issues/11) | P1 |
 | minutes 门槛+通知择一 | [#12](https://github.com/mustcarrayout/pcri/issues/12) | P1 |
+| F10 启动零摩擦 | [#16](https://github.com/mustcarrayout/pcri/issues/16) | P1(含 Pi 提示词冲突决策点) |
+| F11 反馈即引导 | [#17](https://github.com/mustcarrayout/pcri/issues/17) | P1 |
 | FSRS 升级 | [#13](https://github.com/mustcarrayout/pcri/issues/13) | P2 |
 | 笔记级复习 | [#14](https://github.com/mustcarrayout/pcri/issues/14) | P2 |
 | §11 开放问题拍板 | [#15](https://github.com/mustcarrayout/pcri/issues/15) | 进行中 |
