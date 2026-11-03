@@ -440,4 +440,9 @@ body{padding:env(safe-area-inset-top) env(safe-area-inset-right) env(safe-area-i
 .chat-teachback-text{flex:1;min-width:0;display:grid;gap:2px}
 .chat-teachback-text i{font-style:normal;color:#79837a;font-size:10px;word-break:break-all}
 .chat-teachback-text em{font-style:normal;color:#a85e48;font-size:10px}
+.chat-teachback-actions{display:flex;flex-wrap:wrap;gap:4px;flex-basis:100%}
+.review-feedback{margin:6px 0 0;padding:6px 9px;border-radius:8px;background:#f8f4e8;color:#8a6a35;font-size:11px;text-align:left;word-break:break-all}
+.review-feedback.recall{background:#eef4e0;color:#55703a}
+.review-transition{display:block;margin-top:5px;color:#79837a;font-size:10px;text-align:left}
+.review-summary{display:block;margin-top:4px;color:#79837a;font-size:10px}
 @media(max-width:620px){.loop-review-go{min-height:44px;font-size:14px}.map-add{grid-template-columns:1fr auto}.map-add .primary-button{grid-column:1/-1}.review-grades .grade{min-height:48px}}

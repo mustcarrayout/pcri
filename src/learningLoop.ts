@@ -860,15 +860,20 @@ function recomputePointStatus(point: KnowledgePoint): void {
   else point.status = "dark";
 }
 
-/** 知识点证据入口:复习与教回都汇到这里,四态在此收口 */
-export function applyPointEvidence(pointId: string, correct: boolean): void {
+/** 知识点证据入口:复习与教回都汇到这里,四态在此收口;返回 {from,to} 状态迁移,无变化返回 null(#17) */
+export function applyPointEvidence(
+  pointId: string,
+  correct: boolean,
+): { from: PointStatus; to: PointStatus } | null {
   const point = store.points.find((item) => item.id === pointId);
-  if (!point) return;
+  if (!point) return null;
+  const from = point.status;
   if (point.status === "dark" && point.mastery === 0)
     point.mastery = BKT.p0; // 首次证据:从先验出发
   bktUpdate(point, correct);
   recomputePointStatus(point);
   persist();
+  return from === point.status ? null : { from, to: point.status };
 }
 
 /** 教回:covered 视作一次 correct;遗漏不自动降级(FSD §5.4) */
@@ -1034,8 +1039,11 @@ export function draftCards(): ReviewCard[] {
   return store.cards.filter((item) => item.status === "draft");
 }
 
-/** SM-2 三档(FSD §4.2):忘→重置 1 天;模糊→正常晋升但 EF 微降;记得→正常晋升 */
-export function scheduleCard(card: ReviewCard, grade: ReviewGrade): void {
+/** SM-2 三档(FSD §4.2):忘→重置 1 天;模糊→正常晋升但 EF 微降;记得→正常晋升;返回知识点状态迁移(#17) */
+export function scheduleCard(
+  card: ReviewCard,
+  grade: ReviewGrade,
+): { from: PointStatus; to: PointStatus } | null {
   if (grade === "forgot") {
     card.intervalDays = 1;
     card.ease = Math.max(1.3, card.ease - 0.2);
@@ -1051,8 +1059,11 @@ export function scheduleCard(card: ReviewCard, grade: ReviewGrade): void {
     reviewedAt: new Date().toISOString(),
     grade,
   });
-  if (card.pointId) applyPointEvidence(card.pointId, grade !== "forgot");
+  const transition = card.pointId
+    ? applyPointEvidence(card.pointId, grade !== "forgot")
+    : null;
   persist();
+  return transition;
 }
 
 export interface QueueEntry {
@@ -1141,4 +1152,97 @@ export function resolveNextAction(
   if (gap && gap.level !== "solid" && (gap.gaps || "").trim())
     return { source: "reteach", cardId: null, micro: "" };
   return null;
+}
+
+// ── 反馈即引导(FSD §15,issue #17):四个反馈时刻的纯逻辑 ──
+// 铁律:无人格表扬、无红点倒计时、不弹窗打断,文案永远与下一步动作同现。
+
+export interface ReviewStats {
+  count: number;
+  forgot: number;
+  fuzzy: number;
+  recall: number;
+}
+
+/** 今日复习三档汇总:仅统计今日 review_log(本地日比较);默认读 store,可注入数据测试 */
+export function todayReviewStats(
+  logs: Pick<ReviewLogEntry, "reviewedAt" | "grade">[] = store.reviewLogs,
+  today: string = todayKey(),
+): ReviewStats {
+  const stats: ReviewStats = { count: 0, forgot: 0, fuzzy: 0, recall: 0 };
+  for (const log of logs) {
+    const day = dateKey(new Date(log.reviewedAt));
+    if (day !== today) continue;
+    stats.count += 1;
+    if (log.grade === "forgot") stats.forgot += 1;
+    else if (log.grade === "fuzzy") stats.fuzzy += 1;
+    else stats.recall += 1;
+  }
+  return stats;
+}
+
+/** 里程碑节点(连续天数) */
+export const MILESTONES = [3, 7, 21, 50, 100];
+
+/** 里程碑跨越:从 prevStreak 推进到 nextStreak 跨过节点时返回该节点(一次跨多个取最小),否则 null */
+export function milestoneHit(prevStreak: number, nextStreak: number): number | null {
+  for (const milestone of MILESTONES) {
+    if (prevStreak < milestone && nextStreak >= milestone) return milestone;
+  }
+  return null;
+}
+
+export interface TeachbackGap {
+  pointId: string;
+  pointName: string;
+  quote: string;
+}
+
+/** 教回差距提取:仅取 covered=false 且引文非空的条目,映射知识点名;解析不到的点剔除 */
+export function teachbackGaps(results: TeachbackResult[]): TeachbackGap[] {
+  const gaps: TeachbackGap[] = [];
+  for (const item of results) {
+    if (item.covered || !item.quote.trim()) continue;
+    const point = pointById(item.pointId);
+    if (!point) continue;
+    gaps.push({ pointId: item.pointId, pointName: point.name, quote: item.quote });
+  }
+  return gaps;
+}
+
+const POINT_STATUS_LABELS: Record<PointStatus, string> = {
+  dark: "未探索",
+  touched: "已接触",
+  shaky: "边缘",
+  mastered: "已掌握",
+};
+
+const POINT_STATUS_NEXT: Record<PointStatus, string> = {
+  dark: "从下一张卡重新建立接触",
+  touched: "再答对一次就进入边缘",
+  shaky: "复习队列里会优先排它",
+  mastered: "复习间隔会继续拉长",
+};
+
+/** 知识点状态迁移轻提示:一行内联,点名 + 迁移 + 下一步 */
+export function pointTransitionText(
+  pointName: string,
+  transition: { from: PointStatus; to: PointStatus },
+): string {
+  return `${pointName}:${POINT_STATUS_LABELS[transition.from]} → ${
+    POINT_STATUS_LABELS[transition.to]
+  };${POINT_STATUS_NEXT[transition.to]}`;
+}
+
+/** 「忘」的回忆线索模板:原文锚点 + 下一步;Pi 可用时由调用方替换为生成线索 */
+export function recallHintText(sourceText: string): string {
+  const anchor = sourceText.trim().slice(0, 60);
+  return anchor
+    ? `先回正面看一遍提示,再对照你当时的记录:「${anchor}」。这张明天会再来。`
+    : "先回正面看一遍提示。这张明天会再来。";
+}
+
+/** 队列清空汇总行:今日张数 + 三档分布 + 明天见 */
+export function reviewSummaryText(stats: ReviewStats): string {
+  return `今天复习了 ${stats.count} 张:记起 ${stats.recall} · 模糊 ${stats.fuzzy} · 忘了 ${stats.forgot}。明天见。`;
 }

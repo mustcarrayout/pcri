@@ -245,7 +245,7 @@ SQLite → localStorage 模拟;本地通知 → 不发(控制台提示);语音�
 3. **通知策略**(§7):P0 为单条静态复习提醒 21:00;"择一触发"与时段配置延后。
 4. **Pi 工具**(§6/§6.1,#8;§13,#9):`create_challenge` / `draft_cards` / `challenge_reminder` / `assess_teachback` 已接入对话流(建议制:确认卡、掌握地图收下、文案缓存、教回草稿应用门);`frontier_report`、`challenge_review` 等仍未接入,提醒时段配置延后。
 5. **里程碑徽标**(§3.3):连续天数已在数据层可算(`challengeStreak`),徽标 UI 与 finished 达成标记呈现待补。
-6. **smoke 测试**:`npm run test:loop`(esbuild 打桩电容模块)104 项断言覆盖 §11 全部规则类验收、§6.1 三工具纯逻辑(含 `goal_note` 迁移的 localStorage 与 SQLite 打桩路径)、§13 教回纯逻辑(BKT forgot 数值锁定)与 §14 启动零摩擦纯逻辑。
+6. **smoke 测试**:`npm run test:loop`(esbuild 打桩电容模块)126 项断言覆盖 §11 全部规则类验收、§6.1 三工具纯逻辑(含 `goal_note` 迁移的 localStorage 与 SQLite 打桩路径)、§13 教回纯逻辑(BKT forgot 数值锁定)、§14 启动零摩擦纯逻辑与 §15 反馈即引导纯逻辑。
 7. **启动零摩擦**(#16,§14):「再讲」微动作与微版起步同样建 `微版` 标签事件走统一结束流(规格未指明其点击行为,取同流最小实现);计时为单一内存槽,进行中点击其他主题 chip 忽略;空 `nextStep` 主题由条上兜底「拆第一周的任务」保证每非搁置主题恰好一枚 chip;浏览器演示路径读补 `micro` 空串;微版事件完成由结束流程显式 `recordApplication`、经既有 `topicTaskStats` 计入任务统计(「用过」证据,§14 决策记录已接受)。
 
 ## 13. 费曼教回实现增补(P1,#9,落实 §5.4 与 §6)

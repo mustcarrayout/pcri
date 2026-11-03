@@ -3,6 +3,7 @@
 // 以及 §6.1 Issue #8:Pi 三工具纯逻辑(草稿规整/确认幂等/来源读取/批量校验/文案选择/goal_note 迁移)
 // 以及 §14 Issue #16:启动零摩擦(microStepOf/resolveNextAction/轻打卡幂等依赖)
 // 以及 §13 Issue #9:费曼教回(resolveTeachbackResults/遗漏不降级/BKT forgot 数值锁定)
+// 以及 §15 Issue #17:反馈即引导(状态迁移/今日汇总/里程碑跨越/差距提取/反馈文案)
 import * as loop from "../src/learningLoop";
 import { native } from "./stubs/core.mjs";
 import { fakeDb } from "./stubs/sqlite.mjs";
@@ -730,11 +731,172 @@ async function teachbackTests() {
   );
 }
 
+// ══ FSD §15 Issue #17:反馈即引导纯逻辑 ══
+async function feedbackTests() {
+  const t = "t-fb";
+  const pe = loop.addKnowledgePoint({ topicId: t, name: "迁移点" });
+  ok(!("error" in pe), "#17 建迁移观察点");
+  const peR = pe as Exclude<typeof pe, { error: string }>;
+
+  // 1) applyPointEvidence/scheduleCard 返回迁移值
+  const tr1 = loop.applyPointEvidence(peR.id, true);
+  ok(!!tr1 && tr1.from === "dark" && tr1.to === "touched", "首次证据 dark→touched", tr1);
+  const tr2 = loop.applyPointEvidence(peR.id, true);
+  ok(
+    !!tr2 && tr2.from === "touched" && tr2.to === "shaky",
+    "证据把 mastery 推过 0.5 → shaky",
+    tr2,
+  );
+  const tr3 = loop.applyPointEvidence(peR.id, true);
+  ok(
+    !!tr3 && tr3.from === "shaky" && tr3.to === "mastered",
+    "mastery 达到 0.85 以上 → mastered",
+    tr3,
+  );
+  const fbCard = loop.createCard({
+    topicId: t,
+    pointId: peR.id,
+    sourceType: "manual",
+    sourceId: `manual:${today}`,
+    sourceTitle: "反馈",
+    front: "迁移卡",
+    back: "答案",
+    active: true,
+  });
+  ok(!("error" in fbCard), "#17 建迁移挂接卡");
+  const fbCardR = fbCard as Exclude<typeof fbCard, { error: string }>;
+  const trForgot1 = loop.scheduleCard(fbCardR, "forgot");
+  ok(
+    !!trForgot1 && trForgot1.from === "mastered" && trForgot1.to === "shaky",
+    "挂接卡连续 forgot 第一击 mastered→shaky",
+    trForgot1,
+  );
+  const trForgot2 = loop.scheduleCard(fbCardR, "forgot");
+  ok(trForgot2 === null, "状态未变化返回 null", trForgot2);
+
+  // 2) todayReviewStats:仅统计今日,昨日/更早不串入
+  const liveBefore = loop.todayReviewStats();
+  const statCard = loop.createCard({
+    topicId: t,
+    pointId: null,
+    sourceType: "manual",
+    sourceId: `manual:${today}`,
+    sourceTitle: "汇总",
+    front: "汇总卡",
+    back: "答案",
+    active: true,
+  });
+  ok(!("error" in statCard), "#17 建汇总卡");
+  const statCardR = statCard as Exclude<typeof statCard, { error: string }>;
+  loop.scheduleCard(statCardR, "fuzzy");
+  const liveAfter = loop.todayReviewStats();
+  ok(
+    liveAfter.count === liveBefore.count + 1 &&
+      liveAfter.fuzzy === liveBefore.fuzzy + 1,
+    "今日复习汇总计入新一次自评",
+    { before: liveBefore, after: liveAfter },
+  );
+  const mixedLogs = [
+    { cardId: "c", reviewedAt: `${today}T09:00:00`, grade: "recall" as const },
+    { cardId: "c", reviewedAt: `${today}T11:00:00`, grade: "forgot" as const },
+    { cardId: "c", reviewedAt: `${today}T12:00:00`, grade: "fuzzy" as const },
+    { cardId: "c", reviewedAt: `${loop.addDays(today, -1)}T12:00:00`, grade: "recall" as const },
+    { cardId: "c", reviewedAt: `${loop.addDays(today, -30)}T12:00:00`, grade: "fuzzy" as const },
+  ];
+  const mixedStats = loop.todayReviewStats(mixedLogs, today);
+  ok(
+    mixedStats.count === 3 &&
+      mixedStats.recall === 1 &&
+      mixedStats.forgot === 1 &&
+      mixedStats.fuzzy === 1,
+    "三档计数只统计今日,昨日/更早日志不串入",
+    mixedStats,
+  );
+
+  // 3) milestoneHit:跨越 3/7/21/50/100 各恰好一次;区间推进或同值 null
+  ok(
+    loop.milestoneHit(2, 3) === 3 &&
+      loop.milestoneHit(6, 7) === 7 &&
+      loop.milestoneHit(20, 21) === 21 &&
+      loop.milestoneHit(49, 50) === 50 &&
+      loop.milestoneHit(99, 100) === 100,
+    "跨越 3/7/21/50/100 各返回对应里程碑",
+  );
+  ok(
+    loop.milestoneHit(3, 4) === null &&
+      loop.milestoneHit(7, 7) === null &&
+      loop.milestoneHit(0, 2) === null,
+    "区间内推进或重复同值返回 null",
+  );
+  ok(loop.milestoneHit(2, 8) === 3, "一次跨多个节点返回最小者(逐日推进下各恰好一次)");
+
+  // 4) teachbackGaps:仅取 covered=false 且引文非空,映射知识点名
+  const g1 = loop.addKnowledgePoint({ topicId: t, name: "方差" });
+  const g2 = loop.addKnowledgePoint({ topicId: t, name: "假设检验" });
+  ok(!("error" in g1) && !("error" in g2), "#17 建差距提取用知识点");
+  const g1R = g1 as Exclude<typeof g1, { error: string }>;
+  const g2R = g2 as Exclude<typeof g2, { error: string }>;
+  const gaps = loop.teachbackGaps([
+    { pointId: g1R.id, covered: false, quote: "讲了方差但没讲清用途" },
+    { pointId: g2R.id, covered: true, quote: "讲清了" },
+    { pointId: g2R.id, covered: false, quote: "假设检验部分卡壳" },
+    { pointId: g1R.id, covered: false, quote: "   " },
+    { pointId: "ghost-point", covered: false, quote: "不存在的点" },
+  ]);
+  ok(gaps.length === 2, "covered=true 与空引文条目被排除", gaps);
+  ok(
+    gaps[0]?.pointName === "方差" &&
+      gaps[0]?.quote === "讲了方差但没讲清用途" &&
+      gaps[1]?.pointName === "假设检验" &&
+      gaps[1]?.quote === "假设检验部分卡壳",
+    "差距条目映射知识点名并保留引文",
+    gaps,
+  );
+
+  // 5) 反馈文案构建:无表扬词、无百分比,含下一步信息
+  const hint = loop.recallHintText("我讲了方差但没说用途");
+  ok(
+    hint.includes("方差") && hint.includes("明天"),
+    "回忆线索含原文锚点与下一步(明天再来)",
+    hint,
+  );
+  const transitionText = loop.pointTransitionText("迁移点", {
+    from: "mastered",
+    to: "shaky",
+  });
+  ok(
+    transitionText.includes("迁移点") &&
+      transitionText.includes("已掌握") &&
+      transitionText.includes("边缘"),
+    "轻提示含点名与状态迁移",
+    transitionText,
+  );
+  const summaryText = loop.reviewSummaryText({
+    count: 5,
+    forgot: 1,
+    fuzzy: 1,
+    recall: 3,
+  });
+  ok(
+    summaryText.includes("明天见") && summaryText.includes("5"),
+    "汇总行含张数与明天见",
+    summaryText,
+  );
+  for (const text of [hint, transitionText, summaryText]) {
+    ok(
+      !/(真棒|厉害|满分)/.test(text) && !text.includes("%"),
+      "反馈文案无表扬词、无百分比数字",
+      text,
+    );
+  }
+}
+
 void (async () => {
   try {
     await piToolTests();
     await zeroFrictionTests();
     await teachbackTests();
+    await feedbackTests();
   } catch (error) {
     fail += 1;
     console.log("  FAIL Pi 工具用例异常", error);

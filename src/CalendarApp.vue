@@ -40,17 +40,24 @@ import {
   initLoopStorage,
   lightCheckin,
   loadLoopReminderCopy,
+  MILESTONES,
+  milestoneHit,
   normalizeChallengeSuggestion,
   normalizePiCardBatch,
   resolveNextAction,
   pendingDraftCount,
   pickLoopReminderCopy,
   pointById,
+  pointTransitionText,
+  recallHintText,
   recordEventDone,
   resolveTeachbackResults,
+  reviewSummaryText,
+  scheduleCard,
+  teachbackGaps,
+  todayReviewStats,
   removeKnowledgePoint,
   resumeChallenge,
-  scheduleCard,
   todayKey,
   topicMasteryPercent,
   topicPoints,
@@ -61,6 +68,7 @@ import {
   type NextAction,
   type PointStatus,
   type QueueEntry,
+  type ReviewCard,
   type ReviewGrade,
 } from "./learningLoop";
 import {
@@ -127,14 +135,18 @@ interface ChatMessage {
   challengeSaved?: boolean;
   /** Pi assess_teachback 产出的教回评估草稿;用户点应用才写库(FSD §13,#9) */
   teachbackDraft?: TeachbackDraft;
+  /** 红线暂停消息携带的主题 id,渲染可点击「继续挑战」(FSD §15.3,#17) */
+  resumeTopicId?: string;
+  resumed?: boolean;
 }
-/** 教回评估草稿的展示条目(名称+引文,标摇态仅内存) */
+/** 教回评估草稿的展示条目(名称+引文,标摇态与差距动作态仅内存) */
 interface TeachbackDraftItemView {
   pointId: string;
   pointName: string;
   covered: boolean;
   quote: string;
   marked?: boolean;
+  actions?: { card?: boolean; task?: boolean; reteach?: boolean };
 }
 interface TeachbackDraft {
   topicId: string;
@@ -2030,14 +2042,19 @@ function bumpLoop() {
 const MICRO_TAG = "微版";
 /** 事件勾选完成时,给标题/标签能对上的主题记一次挑战打卡 */
 function recordLoopCheckin(event: CalendarEvent) {
-  if (event.category === "work") return; // PRD 非目标:钉钉/工作事件不参与学习闭环
+  if (event.category === "work") return; // PRD 非目标:钉钉/工作事件不参与学习闭环(也不触发任何反馈时刻)
   if (event.tags.includes(MICRO_TAG)) return; // #16:微版起步零门槛,完成走结束流程的 lightCheckin
   for (const topic of topics.value) {
     const related =
       event.tags.includes(topic.title) ||
       event.tags.some((tag) => tag === topic.goalTag) ||
       event.title.includes(topic.title);
-    if (related) recordEventDone(topic.id, event.date, event.id);
+    if (!related) continue;
+    const challenge = activeChallengeForTopic(topic.id);
+    const before = challenge ? challengeStreak(challenge) : 0;
+    recordEventDone(topic.id, event.date, event.id);
+    if (challenge)
+      pushMilestoneIfCrossed(topic.id, before, challengeStreak(challenge)); // #17 里程碑
   }
   bumpLoop();
 }
@@ -2255,7 +2272,11 @@ function finishNow() {
   recordApplication(event); // 微版事件完成计入「用过」证据(FSD §14 决策记录;evt:id 去重)
   if (running.topicId) {
     const challenge = activeChallengeForTopic(running.topicId);
-    if (challenge) lightCheckin(challenge.id);
+    if (challenge) {
+      const before = challengeStreak(challenge);
+      lightCheckin(challenge.id);
+      pushMilestoneIfCrossed(running.topicId, before, challengeStreak(challenge)); // #17 里程碑
+    }
   }
   openPdca(event, "do");
   pdcaHint.value = "这 2 分钟做了什么?写一句 Do,或按住麦克风说 15 秒。";
@@ -2272,13 +2293,91 @@ function openReview() {
   reviewIndex.value = 0;
   showBack.value = false;
   reviewDoneCount.value = 0;
+  reviewFeedback.value = null;
+  reviewTransition.value = "";
   dialog.value = "review";
+}
+// ── 反馈即引导(FSD §15,#17):自评后的一行反馈与地图轻提示 ──
+interface ReviewFeedback {
+  cardId: string;
+  kind: "forgot" | "recall";
+  text: string;
+}
+const reviewFeedback = ref<ReviewFeedback | null>(null);
+const reviewTransition = ref("");
+const clearedStats = computed(() => todayReviewStats());
+/** source 锚定原文:按 sourceId 回查事件 PDCA/转录/反思;manual/无源退化为 back 首句(如实边界) */
+function sourceAnchorOf(card: ReviewCard): string {
+  const backFirstSentence =
+    card.back.split(/[。;;!!??…\n]/)[0].trim() || card.back;
+  if (card.sourceType === "manual" || !card.sourceId) return backFirstSentence;
+  const event = events.value.find((item) => item.id === card.sourceId);
+  if (!event || event.category === "work") return backFirstSentence;
+  const anchor = [
+    event.pdca.do,
+    event.pdca.check,
+    event.voiceNote,
+    event.reflection,
+    event.pdca.plan,
+  ]
+    .map((text) => (text || "").trim())
+    .filter(Boolean)[0];
+  return anchor ? anchor.slice(0, 60) : backFirstSentence;
+}
+/** Pi 一句话回忆线索:不阻塞翻卡,失败或不可用保留模板;仅替换同一张卡的反馈 */
+async function fetchRecallHint(card: ReviewCard, anchor: string) {
+  if (!aiConfig.value) return;
+  try {
+    const result = await postModelChat({
+      model: aiConfig.value.model,
+      messages: [
+        {
+          role: "system",
+          content:
+            "你是回忆线索生成器:用户自评「忘了」一张复习卡。基于原文锚点给一句话回忆线索,不超过 40 字,提示思考方向但不直接给答案,不用任何表扬词,不用百分数。",
+        },
+        {
+          role: "user",
+          content: `卡片正面:${card.front}\n背面:${card.back}\n原文锚点:${anchor}`,
+        },
+      ],
+      temperature: 0.5,
+      max_tokens: 80,
+      stream: false,
+    });
+    const message = result.choices?.[0]?.message;
+    const text = message?.content?.trim() || modelReply(result);
+    if (text && reviewFeedback.value?.cardId === card.id)
+      reviewFeedback.value.text = `原文:「${anchor}」。回忆线索:${text.slice(0, 60)};这张明天会再来。`;
+  } catch {
+    /* Pi 不可用:模板线索已在展示,不阻塞翻卡 */
+  }
 }
 function gradeCurrent(grade: ReviewGrade) {
   const entry = queue.value[reviewIndex.value];
   if (!entry) return;
-  scheduleCard(entry.card, grade);
+  const transition = scheduleCard(entry.card, grade);
   reviewDoneCount.value += 1;
+  reviewTransition.value = transition
+    ? pointTransitionText(entry.pointName || "知识点", transition)
+    : "";
+  if (grade === "recall") {
+    reviewFeedback.value = {
+      cardId: entry.card.id,
+      kind: "recall",
+      text: `${entry.card.intervalDays} 天后见`,
+    };
+  } else if (grade === "forgot") {
+    const anchor = sourceAnchorOf(entry.card);
+    reviewFeedback.value = {
+      cardId: entry.card.id,
+      kind: "forgot",
+      text: recallHintText(anchor),
+    };
+    void fetchRecallHint(entry.card, anchor);
+  } else {
+    reviewFeedback.value = null;
+  }
   showBack.value = false;
   if (reviewIndex.value + 1 >= queue.value.length) {
     queue.value = [];
@@ -2290,14 +2389,15 @@ function gradeCurrent(grade: ReviewGrade) {
 }
 // 每日复习提醒(FSD §7:P0 单条,固定 21:00;与定时服务 9100 段分开)
 const LOOP_NOTIF_BASE = 9200;
-/** 结算昨日缺口,结果以 Pi 消息呈现(冻结保护/红线暂停) */
+/** 结算昨日缺口,结果以 Pi 消息呈现(冻结保护/红线暂停附选项与可点「继续」;FSD §15.3) */
 function runDailySettle() {
   const settled = dailySettle();
   for (const item of settled) {
     if (item.paused)
       messages.value.push({
         role: "assistant",
-        content: `挑战「${item.challenge.topicTitle}」连着两天没打卡,先帮你暂停了。想继续或重新安排,随时跟我说。`,
+        content: `挑战「${item.challenge.topicTitle}」连着两天没打卡,先帮你暂停了,连续没清零。两个走法:① 点下面「继续挑战」,从今天重新计连续,今天先做一个 2 分钟起步就行;② 直接告诉我你现在的节奏,我把每日门槛和计划重排轻一点(改门槛参数在下个版本)。`,
+        resumeTopicId: item.challenge.topicId,
       });
     else if (item.froze)
       messages.value.push({
@@ -2306,6 +2406,27 @@ function runDailySettle() {
       });
   }
   if (settled.length) bumpLoop();
+}
+/** 红线消息的「继续」按钮:复用既有恢复逻辑(§15.3,降门槛参数归 #12) */
+function resumeFromMessage(message: ChatMessage) {
+  if (!message.resumeTopicId || message.resumed) return;
+  resumeTopicChallenge(message.resumeTopicId);
+  message.resumed = true;
+}
+/** 里程碑:一行证据变化(done/freeze 计数)+ 下一个节点,无庆祝词(§15.3) */
+function pushMilestoneIfCrossed(topicId: string, before: number, after: number) {
+  const milestone = milestoneHit(before, after);
+  if (!milestone) return;
+  const challenge = activeChallengeForTopic(topicId);
+  if (!challenge) return;
+  const progress = challengeProgress(challenge);
+  const next = MILESTONES.find((node) => node > after);
+  messages.value.push({
+    role: "assistant",
+    content: `「${challenge.topicTitle}」连续 ${after} 天(打卡 ${progress.doneCount} 次 · 冻结 ${progress.freezeCount} 次)${
+      next ? `;下一个节点 ${next} 天` : ""
+    }。今天给主题安排下一步了吗?`,
+  });
 }
 async function syncLoopNotifications() {
   if (!Capacitor.isNativePlatform()) return;
@@ -2803,6 +2924,58 @@ function markTeachbackMiss(message: ChatMessage, index: number) {
   applyPointEvidence(item.pointId, false);
   item.marked = true;
   bumpLoop();
+}
+/** 教回差距动作一:加一张卡(createCard 落 draft,走既有草稿确认面板;§15.2) */
+function addGapCard(message: ChatMessage, index: number) {
+  const draft = message.teachbackDraft;
+  const item = draft?.items[index];
+  if (!draft || !item || item.covered || item.actions?.card) return;
+  const result = createCard({
+    topicId: draft.topicId,
+    pointId: item.pointId,
+    sourceType: "manual",
+    sourceId: `teachback:${draft.topicId}`,
+    sourceTitle: "教回差距",
+    front: `讲清「${item.pointName}」`,
+    back: item.quote,
+  });
+  if ("error" in result) return;
+  if (!item.actions) item.actions = {};
+  item.actions.card = true;
+  bumpLoop();
+}
+function addDaysFromToday(days: number): string {
+  const shifted = new Date(`${today.value}T12:00:00`);
+  shifted.setDate(shifted.getDate() + days);
+  return dateKey(shifted);
+}
+/** 教回差距动作二/三:15 分钟任务、三天后再讲——建议事件,确认(saveSuggestion)才落库,完成后经 recordLoopCheckin 计入挑战 */
+function pushGapSuggestion(
+  message: ChatMessage,
+  index: number,
+  kind: "task" | "reteach",
+) {
+  const draft = message.teachbackDraft;
+  const item = draft?.items[index];
+  if (!draft || !item || item.covered) return;
+  if (kind === "task" ? item.actions?.task : item.actions?.reteach) return;
+  const suggestion: EventSuggestion = {
+    title:
+      kind === "task" ? `15 分钟:${item.pointName}` : `三天后再讲:${item.pointName}`,
+    date: kind === "task" ? today.value : addDaysFromToday(3),
+    time: kind === "task" ? "20:00" : "09:00",
+    category: "plan",
+    tags: [draft.topicTitle],
+    important: true,
+    urgent: false,
+  };
+  if (!message.suggestions) message.suggestions = [];
+  message.suggestions.push(suggestion);
+  if (!message.saved) message.saved = [];
+  message.saved[message.suggestions.length - 1] = false;
+  if (!item.actions) item.actions = {};
+  if (kind === "task") item.actions.task = true;
+  else item.actions.reteach = true;
 }
 /** 教回入口(FSD §13):复用 transcribe();无识别结果不调模型零写库;转录+知识点清单走 askPi */
 async function startTeachback(topic: LearningTopic) {
@@ -3880,7 +4053,7 @@ onMounted(() => {
                       >
                       <span class="chat-teachback-text">
                         <b>{{ item.pointName }}</b>
-                        <i v-if="item.covered && item.quote">「{{ item.quote }}」</i>
+                        <i v-if="item.quote">「{{ item.quote }}」</i>
                         <em v-if="item.marked">已记一次没讲清</em>
                       </span>
                       <button
@@ -3895,6 +4068,43 @@ onMounted(() => {
                       >
                         记一次没讲清
                       </button>
+                      <div
+                        v-if="
+                          message.teachbackDraft?.applied &&
+                          !item.covered &&
+                          item.quote
+                        "
+                        class="chat-teachback-actions"
+                      >
+                        <button
+                          v-if="!item.actions?.card"
+                          type="button"
+                          class="chat-save"
+                          @click="addGapCard(message, itemIndex)"
+                        >
+                          加一张卡
+                        </button>
+                        <button
+                          v-if="!item.actions?.task"
+                          type="button"
+                          class="chat-save"
+                          @click="
+                            pushGapSuggestion(message, itemIndex, 'task')
+                          "
+                        >
+                          安排 15 分钟任务
+                        </button>
+                        <button
+                          v-if="!item.actions?.reteach"
+                          type="button"
+                          class="chat-save"
+                          @click="
+                            pushGapSuggestion(message, itemIndex, 'reteach')
+                          "
+                        >
+                          三天后再讲
+                        </button>
+                      </div>
                     </div>
                     <p
                       v-if="message.teachbackDraft.unknown.length"
@@ -3911,6 +4121,18 @@ onMounted(() => {
                       <Check :size="11" />应用本次教回
                     </button>
                   </div>
+                </div>
+                <div
+                  v-if="message.resumeTopicId && !message.resumed"
+                  class="chat-save-list"
+                >
+                  <button
+                    type="button"
+                    class="chat-save"
+                    @click="resumeFromMessage(message)"
+                  >
+                    <Trophy :size="11" />继续挑战
+                  </button>
                 </div>
               </div>
             </div>
@@ -4962,6 +5184,14 @@ onMounted(() => {
               <button type="button" class="grade fuzzy" @click="gradeCurrent('fuzzy')">模糊</button>
               <button type="button" class="grade recall" @click="gradeCurrent('recall')">记得</button>
             </div>
+            <p
+              v-if="reviewFeedback"
+              class="review-feedback"
+              :class="reviewFeedback.kind"
+            >{{ reviewFeedback.text }}</p>
+            <small v-if="reviewTransition" class="review-transition">{{
+              reviewTransition
+            }}</small>
             <small class="review-progress"
               >{{ reviewIndex + 1 }} / {{ queue.length }} · 自评决定下次什么时候再见</small
             >
@@ -4970,6 +5200,9 @@ onMounted(() => {
             <Brain :size="26" />
             <strong>{{ reviewDoneCount ? `本次完成 ${reviewDoneCount} 张` : "今日队列是空的" }}</strong>
             <span>有限容器:今天到这里,明天再来。</span>
+            <small v-if="clearedStats.count" class="review-summary">{{
+              reviewSummaryText(clearedStats)
+            }}</small>
           </div>
         </section>
       </div></Transition
