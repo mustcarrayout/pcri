@@ -243,9 +243,9 @@ SQLite → localStorage 模拟;本地通知 → 不发(控制台提示);语音�
 1. **结算幂等标记落库**(§3.3):`challenge.settled_on` 字段记录"当天已结算",跨多天未打开 App 时只结算昨日一天(简化;连续多天缺席的累积判定由红线回数循环覆盖)。
 2. **实时打卡匹配规则**(§3.3):以「事件标题包含主题名 / 标签等于主题名或 goalTag」判定关联,且显式排除 `work` 类别(钉钉事件不参与);`minutes` 门槛模式模块已支持、UI 未暴露,默认 `one_event`。
 3. **通知策略**(§7):P0 为单条静态复习提醒 21:00;"择一触发"与时段配置延后。
-4. **Pi 工具**(§6):P0 仅落地数据层与手动入口;`create_challenge` 目标笔记起草、`draft_cards`、`assess_teachback`、`frontier_report` 等未接入对话流,卡片草稿面板已就绪待 Pi 产出。
+4. **Pi 工具**(§6/§6.1,#8):`create_challenge` / `draft_cards` / `challenge_reminder` 已接入对话流(建议制:确认卡、掌握地图收下、文案缓存);`assess_teachback`、`frontier_report`、`challenge_review` 等仍未接入,提醒时段配置延后。
 5. **里程碑徽标**(§3.3):连续天数已在数据层可算(`challengeStreak`),徽标 UI 与 finished 达成标记呈现待补。
-6. **smoke 测试**:`npm run test:loop`(esbuild 打桩电容模块)35 项断言覆盖 §11 全部规则类验收。
+6. **smoke 测试**:`npm run test:loop`(esbuild 打桩电容模块)73 项断言覆盖 §11 全部规则类验收与 §6.1 三工具纯逻辑(含 `goal_note` 迁移的 localStorage 与 SQLite 打桩路径)。
 
 ## 13. 费曼教回实现增补(P1,#9,落实 §5.4 与 §6)
 

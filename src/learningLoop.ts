@@ -30,6 +30,8 @@ export interface Challenge {
   status: ChallengeStatus;
   /** daily_settle 幂等标记:已结算到的「结算执行日」 */
   settledOn: string;
+  /** 目标笔记:Pi create_challenge 确认后随挑战落库(FSD §6.1) */
+  goalNote: string;
 }
 
 export interface Checkin {
@@ -88,6 +90,23 @@ export const SHAKY_THRESHOLD = 0.5;
 /** BKT 默认参数,后续可做主题级覆盖 */
 export const BKT = { p0: 0.1, learn: 0.15, guess: 0.2, slip: 0.1 };
 
+// Pi 三工具常量(FSD §6.1:建议制,工具只产草稿与文案)
+/** 挑战天数夹取区间 */
+export const CHALLENGE_DAYS_MIN = 7;
+export const CHALLENGE_DAYS_MAX = 365;
+/** 目标笔记草稿截断上限 */
+export const GOAL_NOTE_LIMIT = 200;
+/** draft_cards 首调来源文本截断上限(pdca/voiceNote/reflection 各一份) */
+export const PI_SOURCE_TEXT_LIMIT = 400;
+/** draft_cards 复调单次最多起草张数 */
+export const PI_CARD_BATCH_LIMIT = 10;
+/** challenge_reminder 缓存文案长度上限 */
+export const REMINDER_TITLE_LIMIT = 30;
+export const REMINDER_BODY_LIMIT = 160;
+/** 静态回退文案,与 P0 通知模板逐字一致(CalendarApp syncLoopNotifications) */
+export const LOOP_REMINDER_TITLE = "拾序 · 今日复习";
+export const LOOP_REMINDER_BODY = "复习队列已就绪,几分钟就能清空;边缘知识点优先。";
+
 const DB_VERSION = 1;
 const LOOP_KEY = "shixu-learning-loop-v1";
 const MILLISECONDS_PER_DAY = 86_400_000;
@@ -128,7 +147,8 @@ const SCHEMA = `
     start_date TEXT NOT NULL, total_days INTEGER NOT NULL,
     threshold TEXT NOT NULL, threshold_minutes INTEGER,
     freezes_left INTEGER NOT NULL DEFAULT 2,
-    status TEXT NOT NULL DEFAULT 'active', settled_on TEXT NOT NULL DEFAULT ''
+    status TEXT NOT NULL DEFAULT 'active', settled_on TEXT NOT NULL DEFAULT '',
+    goal_note TEXT NOT NULL DEFAULT ''
   );
   CREATE TABLE IF NOT EXISTS loop_checkin (
     id TEXT PRIMARY KEY NOT NULL, challenge_id TEXT NOT NULL, date TEXT NOT NULL,
@@ -173,6 +193,7 @@ async function initSqlite(): Promise<boolean> {
     await nativeDb.execute(SCHEMA);
     db = nativeDb;
     backend = "sqlite";
+    await migrateLoopSchema();
     return true;
   } catch {
     // SQLite 初始化失败时退回 localStorage,不阻塞应用
@@ -182,11 +203,31 @@ async function initSqlite(): Promise<boolean> {
   }
 }
 
+/** 旧库迁移(FSD §6.1):loop_challenge 缺 goal_note 列时 PRAGMA 探测后 ALTER 补上 */
+async function migrateLoopSchema(): Promise<void> {
+  if (!db) return;
+  try {
+    const info = await db.query("PRAGMA table_info(loop_challenge)");
+    const columns = new Set((info.values || []).map((row) => String(row.name)));
+    if (columns.size > 0 && !columns.has("goal_note"))
+      await db.execute(
+        "ALTER TABLE loop_challenge ADD COLUMN goal_note TEXT NOT NULL DEFAULT ''",
+      );
+  } catch {
+    // 探测失败不阻塞启动;读取时 goal_note 兜底空串
+  }
+}
+
 function loadLocal() {
   try {
     const raw = localStorage.getItem(LOOP_KEY);
     const parsed = raw ? (JSON.parse(raw) as LoopStore) : null;
     store = { ...emptyStore(), ...(parsed || {}) };
+    // 旧数据挑战行缺 goalNote:读补空串而非 undefined(FSD §6.1)
+    store.challenges = (store.challenges || []).map((item) => ({
+      ...item,
+      goalNote: typeof item.goalNote === "string" ? item.goalNote : "",
+    }));
   } catch {
     store = emptyStore();
   }
@@ -202,7 +243,7 @@ async function saveSqlite() {
     );
     for (const c of store.challenges)
       await db.run(
-        `INSERT INTO loop_challenge (id,topic_id,topic_title,start_date,total_days,threshold,threshold_minutes,freezes_left,status,settled_on) VALUES (?,?,?,?,?,?,?,?,?,?)`,
+        `INSERT INTO loop_challenge (id,topic_id,topic_title,start_date,total_days,threshold,threshold_minutes,freezes_left,status,settled_on,goal_note) VALUES (?,?,?,?,?,?,?,?,?,?,?)`,
         [
           c.id,
           c.topicId,
@@ -214,6 +255,7 @@ async function saveSqlite() {
           c.freezesLeft,
           c.status,
           c.settledOn,
+          c.goalNote,
         ],
       );
     for (const row of store.checkins)
@@ -287,6 +329,7 @@ export async function initLoopStorage(): Promise<"sqlite" | "local"> {
       freezesLeft: Number(row.freezes_left),
       status: String(row.status) as ChallengeStatus,
       settledOn: String(row.settled_on || ""),
+      goalNote: String(row.goal_note || ""),
     }));
     const ci = await db!.query("SELECT * FROM loop_checkin");
     store.checkins = (ci.values || []).map((row) => ({
@@ -343,6 +386,153 @@ export async function initLoopStorage(): Promise<"sqlite" | "local"> {
   return backend;
 }
 
+// ── Pi 三工具纯函数(FSD §6.1:create_challenge / draft_cards / challenge_reminder)──
+// 一律建议制:这里只做规整与校验,落库仍走 createChallenge / createCard 由用户确认触发。
+
+/** create_challenge 的会话确认卡草稿(FSD §6.1 ChallengeSuggestion) */
+export interface ChallengeSuggestion {
+  topicId: string;
+  topicTitle: string;
+  days: number;
+  threshold: "one_event" | "minutes";
+  goalNote: string;
+}
+
+/** 规整挑战草稿:缺 topicId 报错;days 夹取 [7,365](非法时默认 100);goalNote 截断至 GOAL_NOTE_LIMIT */
+export function normalizeChallengeSuggestion(input: {
+  topicId?: unknown;
+  topicTitle?: unknown;
+  days?: unknown;
+  threshold?: unknown;
+  goalNote?: unknown;
+}): ChallengeSuggestion | { error: string } {
+  const topicId = String(input.topicId ?? "").trim();
+  if (!topicId) return { error: "挑战必须绑定学习主题" };
+  const parsedDays = Number(input.days);
+  const days = Number.isFinite(parsedDays)
+    ? Math.min(CHALLENGE_DAYS_MAX, Math.max(CHALLENGE_DAYS_MIN, Math.round(parsedDays)))
+    : 100;
+  return {
+    topicId,
+    topicTitle: String(input.topicTitle ?? "").trim().slice(0, 60),
+    days,
+    threshold: input.threshold === "minutes" ? "minutes" : "one_event",
+    goalNote: String(input.goalNote ?? "").trim().slice(0, GOAL_NOTE_LIMIT),
+  };
+}
+
+export interface LoopCardSources {
+  pdca: string;
+  voiceNote: string;
+  reflection: string;
+}
+
+/**
+ * draft_cards 首调的来源读取(纯函数,零写入):
+ * category='work'(钉钉)拒绝;三来源全空报错;非空字段各截断至 PI_SOURCE_TEXT_LIMIT。
+ */
+export function extractLoopCardSources(input: {
+  category?: string;
+  pdca?: { plan?: string; do?: string; check?: string; act?: string } | null;
+  voiceNote?: string;
+  reflection?: string;
+}): LoopCardSources | { error: string } {
+  if (input.category === "work") return { error: "钉钉/工作类事件不参与学习闭环" };
+  const pdcaText = [input.pdca?.plan, input.pdca?.do, input.pdca?.check, input.pdca?.act]
+    .map((text) => (text || "").trim())
+    .filter(Boolean)
+    .join("\n")
+    .slice(0, PI_SOURCE_TEXT_LIMIT);
+  const voiceNote = (input.voiceNote || "").trim().slice(0, PI_SOURCE_TEXT_LIMIT);
+  const reflection = (input.reflection || "").trim().slice(0, PI_SOURCE_TEXT_LIMIT);
+  if (!pdcaText && !voiceNote && !reflection)
+    return { error: "该事项没有可用的复习素材(PDCA、语音、复盘都为空)" };
+  return { pdca: pdcaText, voiceNote, reflection };
+}
+
+export interface PiDraftCardInput {
+  front: string;
+  back: string;
+  source: "pdca" | "transcript" | "reflection";
+}
+
+/** draft_cards 复调批量校验:超 PI_CARD_BATCH_LIMIT 张截断为前 N 张;front/back 为空的跳过并计入 skipped,不中断整批 */
+export function normalizePiCardBatch(raw: unknown): {
+  cards: PiDraftCardInput[];
+  skipped: number;
+  truncated: boolean;
+} {
+  const list = Array.isArray(raw) ? raw : [];
+  const bounded = list.slice(0, PI_CARD_BATCH_LIMIT);
+  const cards: PiDraftCardInput[] = [];
+  let skipped = 0;
+  for (const item of bounded) {
+    const record = (item || {}) as Record<string, unknown>;
+    const front = String(record.front ?? "").trim();
+    const back = String(record.back ?? "").trim();
+    if (!front || !back) {
+      skipped += 1;
+      continue;
+    }
+    const rawSource = String(record.source || "");
+    const source: PiDraftCardInput["source"] =
+      rawSource === "transcript" || rawSource === "reflection" ? rawSource : "pdca";
+    cards.push({ front, back, source });
+  }
+  return { cards, skipped, truncated: list.length > PI_CARD_BATCH_LIMIT };
+}
+
+// ── 通知文案缓存(challenge_reminder:只管文案,不写 loop 库)──
+
+const REMINDER_KEY = "shixu-loop-reminder-v1";
+
+export interface LoopReminderCopy {
+  date: string;
+  title: string;
+  body: string;
+}
+
+export function loadLoopReminderCopy(): LoopReminderCopy | null {
+  try {
+    const raw = localStorage.getItem(REMINDER_KEY);
+    if (!raw) return null;
+    const parsed = JSON.parse(raw) as Partial<LoopReminderCopy> | null;
+    if (!parsed || typeof parsed !== "object") return null;
+    return {
+      date: typeof parsed.date === "string" ? parsed.date : "",
+      title: typeof parsed.title === "string" ? parsed.title : "",
+      body: typeof parsed.body === "string" ? parsed.body : "",
+    };
+  } catch {
+    return null;
+  }
+}
+
+/** 缓存当日文案(仅本地 localStorage,同日重调覆盖) */
+export function cacheLoopReminderCopy(title: string, body: string): LoopReminderCopy {
+  const copy: LoopReminderCopy = {
+    date: todayKey(),
+    title: title.trim().slice(0, REMINDER_TITLE_LIMIT) || LOOP_REMINDER_TITLE,
+    body: body.trim().slice(0, REMINDER_BODY_LIMIT),
+  };
+  try {
+    localStorage.setItem(REMINDER_KEY, JSON.stringify(copy));
+  } catch {
+    /* 存储满时静默;pick 未命中会回退静态模板 */
+  }
+  return copy;
+}
+
+/** 缓存命中(当天且标题/正文非空)返回缓存文案;未命中、过期或为空回退静态模板 */
+export function pickLoopReminderCopy(
+  cached: LoopReminderCopy | null | undefined,
+  today: string,
+): { title: string; body: string } {
+  if (cached && cached.date === today && cached.title.trim() && cached.body.trim())
+    return { title: cached.title, body: cached.body };
+  return { title: LOOP_REMINDER_TITLE, body: LOOP_REMINDER_BODY };
+}
+
 // ── 日期工具 ──
 
 export const dateKey = (value: Date) =>
@@ -373,6 +563,7 @@ export function createChallenge(input: {
   threshold?: "one_event" | "minutes";
   thresholdMinutes?: number;
   startDate?: string;
+  goalNote?: string; // Pi create_challenge 确认后随挑战落库(FSD §6.1)
 }): Challenge | { error: string } {
   if (!input.topicId) return { error: "必须绑定学习主题" };
   const existing = store.challenges.find(
@@ -392,6 +583,7 @@ export function createChallenge(input: {
     freezesLeft: 2,
     status: "active",
     settledOn: "",
+    goalNote: (input.goalNote || "").trim().slice(0, GOAL_NOTE_LIMIT),
   };
   store.challenges.push(challenge);
   persist();
@@ -839,6 +1031,9 @@ export function buildDailyQueue(topicId?: string): QueueEntry[] {
   }));
 }
 
-export function pendingDraftCount(): number {
-  return store.cards.filter((item) => item.status === "draft").length;
+/** 待确认草稿数;传 topicId 时只数该主题(主题卡徽标接线,FSD §6.1) */
+export function pendingDraftCount(topicId?: string): number {
+  return store.cards.filter(
+    (item) => item.status === "draft" && (!topicId || item.topicId === topicId),
+  ).length;
 }

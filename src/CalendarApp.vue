@@ -19,10 +19,12 @@ import {
 } from "./routines";
 import {
   DAILY_QUEUE_LIMIT,
+  LOOP_REMINDER_TITLE,
   abandonChallenge,
   activeChallengeForTopic,
   addKnowledgePoint,
   buildDailyQueue,
+  cacheLoopReminderCopy,
   challengeProgress,
   challengeStreak,
   confirmCard,
@@ -31,17 +33,25 @@ import {
   dailySettle,
   discardDraft,
   draftCards,
+  extractLoopCardSources,
   hasLoopActivity,
   initLoopStorage,
+  loadLoopReminderCopy,
+  normalizeChallengeSuggestion,
+  normalizePiCardBatch,
+  pendingDraftCount,
+  pickLoopReminderCopy,
   recordEventDone,
   removeKnowledgePoint,
   resumeChallenge,
   scheduleCard,
+  todayKey,
   topicMasteryPercent,
   topicPoints,
   type BloomLevel,
   type Challenge,
   type ChallengeProgress,
+  type ChallengeSuggestion,
   type PointStatus,
   type QueueEntry,
   type ReviewGrade,
@@ -103,6 +113,9 @@ interface ChatMessage {
   content: string;
   suggestions?: EventSuggestion[];
   saved?: boolean[];
+  /** Pi create_challenge 产出的挑战确认卡;用户点确认才落库(FSD §6.1) */
+  challengeDraft?: ChallengeSuggestion;
+  challengeSaved?: boolean;
 }
 interface EventSuggestion {
   title: string;
@@ -1225,7 +1238,7 @@ async function postModelChat(
 }
 // Pi 工具驱动：模型通过工具读写日历，App 本地执行；写入类操作经确认卡落库
 const PI_AGENT_PROMPT =
-  "你是学习教练，驾驶一个以「学习主题」为核心的 App：日历只是主题在时间里的投影。create_topic 建主题（先问清楚为什么学、在哪用）；update_topic 推进主题状态（在学→能用→能教：能脱稿讲清=能用，能用且真的用过=能教）和下一步；plan_goal 把主题拆成 2-8 个任务（每件 30-90 分钟）写入日历，共用「目标·主题名」标签；query_day 查日程；propose_event 建议新事项；propose_pdca 为事项写 PDCA；start_feynman 用费曼检验用户是否真的学会了；save_feynman_result 记录结果（自动挂到主题证据链）。你的职责是推着每个主题往前走：讲过（费曼）和用过（完成任务）才算证据，没有证据就不要说用户学会了。学习档案里上次的差距，是这次对话的起点。";
+  "你是学习教练，驾驶一个以「学习主题」为核心的 App：日历只是主题在时间里的投影。create_topic 建主题（先问清楚为什么学、在哪用）；update_topic 推进主题状态（在学→能用→能教：能脱稿讲清=能用，能用且真的用过=能教）和下一步；plan_goal 把主题拆成 2-8 个任务（每件 30-90 分钟）写入日历，共用「目标·主题名」标签；query_day 查日程；propose_event 建议新事项；propose_pdca 为事项写 PDCA；start_feynman 用费曼检验用户是否真的学会了；save_feynman_result 记录结果（自动挂到主题证据链）；create_challenge 给学习主题发起百日挑战（问清天数和一句目标笔记，生成确认卡，用户点确认才开始）；draft_cards 把已有事项的记录起草成复习卡（两步：先只传 event_title 读素材，再带 cards 数组交草稿，用户在掌握地图确认）；challenge_reminder 在一天学习收尾时，用一句提醒语气的话概括当日状态，作为今晚复习提醒的文案。你的职责是推着每个主题往前走：讲过（费曼）和用过（完成任务）才算证据，没有证据就不要说用户学会了。学习档案里上次的差距，是这次对话的起点。";
 const PI_TOOLS = [
   {
     type: "function",
@@ -1455,6 +1468,93 @@ const PI_TOOLS = [
           act: { type: "string", description: "调整；无则留空" },
         },
         required: ["event_title"],
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "create_challenge",
+      description:
+        "为学习主题发起百日挑战。会生成确认卡片，用户点击确认后才会真正开始；确认前不要向用户声称挑战已经开始。先确认天数，再问一句目标笔记（挑战成功后用户能用它做成什么）。工作/钉钉事件不参与挑战打卡。",
+      parameters: {
+        type: "object",
+        properties: {
+          topic: { type: "string", description: "学习主题名或其一部分" },
+          days: {
+            type: "number",
+            description: "挑战天数，7-365；不填默认 100",
+          },
+          threshold: {
+            type: "string",
+            enum: ["one_event", "minutes"],
+            description: "每日打卡门槛；默认 one_event=每天至少完成 1 个该主题事项",
+          },
+          goal_note: {
+            type: "string",
+            description: "目标笔记：挑战成功后用户能用这个主题做成什么，一句话",
+          },
+        },
+        required: ["topic"],
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "draft_cards",
+      description:
+        "把用户已有事项里记录的内容（PDCA/语音转录/复盘）起草成复习卡，两步调用：第一步只传 event_title 读取该事项的素材（不写库）；第二步基于素材带上 cards 数组（每张含 front/back，最多 10 张）生成草稿，用户在掌握地图「Pi 起草的卡片」确认后才会进入复习队列。工作/钉钉事件会被拒绝。",
+      parameters: {
+        type: "object",
+        properties: {
+          event_title: {
+            type: "string",
+            description: "目标事项的名称或名称的一部分",
+          },
+          topic: {
+            type: "string",
+            description: "卡片归属的学习主题名；不填自动匹配事项关联的主题",
+          },
+          cards: {
+            type: "array",
+            description:
+              "第二步才传：要起草的复习卡，从素材里提炼问题与答案，按理解顺序排列",
+            items: {
+              type: "object",
+              properties: {
+                front: { type: "string", description: "正面：提示或问题" },
+                back: { type: "string", description: "背面：答案或展开" },
+                source: {
+                  type: "string",
+                  enum: ["pdca", "transcript", "reflection"],
+                  description: "内容来源；不填默认 pdca",
+                },
+              },
+              required: ["front", "back"],
+            },
+          },
+        },
+        required: ["event_title"],
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "challenge_reminder",
+      description:
+        "在一天的学习聊得差不多时（或用户要求时）调用：用一句面向用户的提醒语气话（不超过 40 字）概括今天的学习状态与今晚该复习什么，作为今晚 21:00 复习提醒的文案。只缓存文案，不写库。",
+      parameters: {
+        type: "object",
+        properties: {
+          summary: {
+            type: "string",
+            description:
+              "今晚提醒的正文：一句提醒语气的话，贴合今天的实际学习内容，如「今天把假设检验讲顺了，晚上 5 张卡见。」",
+          },
+        },
+        required: ["summary"],
       },
     },
   },
@@ -1936,6 +2036,11 @@ function discardDraftCard(id: string) {
   discardDraft(id);
   bumpLoop();
 }
+/** 主题卡「Pi 起草的卡片」待确认徽标(接线 pendingDraftCount) */
+function topicDraftCount(topicId: string) {
+  void loopTick.value;
+  return pendingDraftCount(topicId);
+}
 function openReview() {
   queue.value = buildDailyQueue();
   reviewIndex.value = 0;
@@ -1992,8 +2097,8 @@ async function syncLoopNotifications() {
         notifications: [
           {
             id: LOOP_NOTIF_BASE,
-            title: "拾序 · 今日复习",
-            body: "复习队列已就绪,几分钟就能清空;边缘知识点优先。",
+            // challenge_reminder 缓存的当日文案优先;缺失或过期回退静态模板(FSD §6.1)
+            ...pickLoopReminderCopy(loadLoopReminderCopy(), todayKey()),
             schedule: { on: { hour: 21, minute: 0 }, allowWhileIdle: true },
           },
         ],
@@ -2291,10 +2396,119 @@ async function toolProposePdca(
   await saveEvents();
   return { ok: true, event: event.title, applied };
 }
+// ── Pi 学习闭环三工具(FSD §6.1):create_challenge / draft_cards / challenge_reminder ──
+// 建议制:工具只产草稿与文案,落库一律由用户确认触发(confirmChallengeDraft / 掌握地图收下)。
+/** 与实时打卡同一条关联规则:标题包含主题名 / 标签等于主题名或 goalTag(§12-2) */
+function matchTopicForEvent(event: CalendarEvent): LearningTopic | undefined {
+  return topics.value.find(
+    (topic) =>
+      event.tags.includes(topic.title) ||
+      event.tags.some((tag) => tag === topic.goalTag) ||
+      event.title.includes(topic.title),
+  );
+}
+function toolCreateChallenge(
+  args: Record<string, unknown>,
+  drafts: ChallengeSuggestion[],
+): Record<string, unknown> {
+  const topic = findTopic(String(args.topic || ""));
+  if (!topic) return { error: `没有找到学习主题「${String(args.topic || "").trim()}」` };
+  // 预检单活跃冲突:有 active/paused 挑战时不产确认卡
+  if (activeChallengeForTopic(topic.id))
+    return {
+      error: "该主题已有进行中的挑战",
+      note: "不要生成确认卡;告知用户已有进行中的挑战,可先继续或放弃后再开新的。",
+    };
+  const normalized = normalizeChallengeSuggestion({
+    topicId: topic.id,
+    topicTitle: topic.title,
+    days: args.days,
+    threshold: args.threshold,
+    goalNote: String(args.goal_note || ""),
+  });
+  if ("error" in normalized) return { error: normalized.error };
+  drafts.push(normalized);
+  return {
+    ok: true,
+    topic: topic.title,
+    days: normalized.days,
+    goal_note: normalized.goalNote,
+    note: "已生成挑战确认卡,等待用户在会话里点击确认;确认前不要重复调用。",
+  };
+}
+function toolDraftCards(args: Record<string, unknown>): Record<string, unknown> {
+  const needle = String(args.event_title || "").trim();
+  if (!needle) return { error: "event_title 为必填" };
+  const event = events.value.find((item) => item.title.includes(needle));
+  if (!event) return { error: `没有找到名称包含「${needle}」的事项` };
+  const sources = extractLoopCardSources({
+    category: event.category,
+    pdca: event.pdca,
+    voiceNote: event.voiceNote,
+    reflection: event.reflection,
+  });
+  if ("error" in sources) return { error: sources.error };
+  const topic =
+    (String(args.topic || "").trim() ? findTopic(String(args.topic || "")) : undefined) ||
+    matchTopicForEvent(event);
+  if (!Array.isArray(args.cards)) {
+    // 第一段:只读来源文本,零写入
+    return {
+      ok: true,
+      stage: "sources",
+      event: event.title,
+      topic: topic?.title || null,
+      sources,
+      note: "已读取素材(未写入任何数据)。请基于素材再调用一次 draft_cards,带上 cards 数组(≤10 张,每张含 front/back)生成草稿。",
+    };
+  }
+  // 第二段:逐张落 draft(不动 active,不建日历事件)
+  if (!topic)
+    return {
+      error: "该事项没有关联的学习主题,无法归档卡片;请让用户指明主题或先给事项打上主题标签",
+    };
+  const batch = normalizePiCardBatch(args.cards);
+  let created = 0;
+  for (const item of batch.cards) {
+    const result = createCard({
+      topicId: topic.id,
+      pointId: null,
+      sourceType: item.source,
+      sourceId: event.id,
+      sourceTitle: event.title,
+      front: item.front,
+      back: item.back,
+    });
+    if (!("error" in result)) created += 1;
+  }
+  bumpLoop();
+  return {
+    ok: true,
+    event: event.title,
+    topic: topic.title,
+    created,
+    skipped: batch.skipped,
+    truncated: batch.truncated,
+    note: `已生成 ${created} 张草稿,放在掌握地图「Pi 起草的卡片」,用户收下后才会进入复习队列。提醒用户去确认。`,
+  };
+}
+function toolChallengeReminder(args: Record<string, unknown>): Record<string, unknown> {
+  const body = String(args.summary || "").trim();
+  if (!body)
+    return { error: "summary 为必填:用一句提醒语气的话概括今天的学习状态" };
+  const cached = cacheLoopReminderCopy(LOOP_REMINDER_TITLE, body);
+  return {
+    ok: true,
+    title: cached.title,
+    body: cached.body,
+    note: "已缓存为今晚 21:00 复习提醒的文案(仅本地缓存,不写库)。告知用户今晚提醒会用这句话。",
+  };
+}
 async function executeTool(
   name: string,
   args: Record<string, unknown>,
   suggestions: EventSuggestion[],
+  challengeDrafts: ChallengeSuggestion[],
 ): Promise<Record<string, unknown>> {
   if (name === "query_day") return toolQueryDay(args);
   if (name === "plan_goal") return await toolPlanGoal(args);
@@ -2306,11 +2520,18 @@ async function executeTool(
     return await toolSaveFeynmanResult(args);
   if (name === "create_topic") return toolCreateTopic(args);
   if (name === "update_topic") return toolUpdateTopic(args);
+  if (name === "create_challenge") return toolCreateChallenge(args, challengeDrafts);
+  if (name === "draft_cards") return toolDraftCards(args);
+  if (name === "challenge_reminder") return toolChallengeReminder(args);
   return { error: `未知工具 ${name}` };
 }
 async function runPiAgent(
   userMessage: string,
-): Promise<{ reply: string; suggestions: EventSuggestion[] }> {
+): Promise<{
+  reply: string;
+  suggestions: EventSuggestion[];
+  challengeDrafts: ChallengeSuggestion[];
+}> {
   if (!aiConfig.value) throw new Error("未配置模型。");
   const chat: Record<string, unknown>[] = [
     { role: "system", content: `${piSystemPrompt()} ${PI_AGENT_PROMPT} ${
@@ -2356,6 +2577,7 @@ async function runPiAgent(
     { role: "user", content: userMessage },
   ];
   const suggestions: EventSuggestion[] = [];
+  const challengeDrafts: ChallengeSuggestion[] = [];
   for (let round = 0; round < 3; round++) {
     let result: ModelChatResult;
     try {
@@ -2386,7 +2608,7 @@ async function runPiAgent(
     if (!calls.length) {
       const reply =
         message?.content?.trim() || modelReply(result) || "暂时没有收到回复。";
-      return { reply, suggestions };
+      return { reply, suggestions, challengeDrafts };
     }
     chat.push({
       role: "assistant",
@@ -2404,7 +2626,7 @@ async function runPiAgent(
       } catch {
         args = {};
       }
-      const output = await executeTool(name, args, suggestions);
+      const output = await executeTool(name, args, suggestions, challengeDrafts);
       chat.push({
         role: "tool",
         tool_call_id: call.id,
@@ -2415,6 +2637,7 @@ async function runPiAgent(
   return {
     reply: "这次调用的工具有点多，先到这里；需要继续随时叫我。",
     suggestions,
+    challengeDrafts,
   };
 }
 function extractJsonObject(text: string): { events?: unknown[] } | null {
@@ -2452,6 +2675,34 @@ async function saveSuggestion(message: ChatMessage, index: number) {
   message.saved[index] = true;
   await saveEvents();
 }
+/** 挑战确认卡:用户点确认才调 createChallenge 落库(含 goal_note);取消零写入(FSD §6.1) */
+function confirmChallengeDraft(message: ChatMessage) {
+  const draft = message.challengeDraft;
+  if (!draft || message.challengeSaved) return;
+  const result = createChallenge({
+    topicId: draft.topicId,
+    topicTitle: draft.topicTitle,
+    totalDays: draft.days,
+    threshold: draft.threshold,
+    goalNote: draft.goalNote,
+  });
+  if ("error" in result) {
+    messages.value.push({
+      role: "assistant",
+      content: `挑战没有开始:${result.error}`,
+    });
+    return;
+  }
+  message.challengeSaved = true;
+  bumpLoop();
+  void syncLoopNotifications();
+}
+/** 事件页入口(FSD §6.1):注入固定请求语走 runPiAgent,draft_cards 两段式完成起草 */
+function draftCardsFromEvent() {
+  const title = pdcaEventTitle.value;
+  if (!title) return;
+  void askPi(`把事项「${title}」里已经记录的内容起草成复习卡。`);
+}
 async function askPi(text?: string) {
   const message = (text || chatText.value).trim();
   if (!message || chatBusy.value) return;
@@ -2469,9 +2720,10 @@ async function askPi(text?: string) {
   chatText.value = "";
   chatBusy.value = true;
   try {
-    const { reply, suggestions } = await runPiAgent(message);
+    const { reply, suggestions, challengeDrafts } = await runPiAgent(message);
     const replyMessage: ChatMessage = { role: "assistant", content: reply };
     if (suggestions.length) replyMessage.suggestions = suggestions;
+    if (challengeDrafts.length) replyMessage.challengeDraft = challengeDrafts[0];
     messages.value.push(replyMessage);
     void scrollChatToBottom();
   } catch (error) {
@@ -3217,6 +3469,39 @@ onMounted(() => {
                     }}
                   </button>
                 </div>
+                <div
+                  v-if="message.challengeDraft"
+                  class="chat-save-list"
+                >
+                  <div class="chat-challenge">
+                    <p class="chat-challenge-title">
+                      <Trophy :size="12" />百日挑战「{{
+                        message.challengeDraft.topicTitle
+                      }}」· {{ message.challengeDraft.days }} 天
+                    </p>
+                    <p
+                      v-if="message.challengeDraft.goalNote"
+                      class="chat-challenge-note"
+                    >
+                      目标笔记：{{ message.challengeDraft.goalNote }}
+                    </p>
+                    <button
+                      type="button"
+                      class="chat-save"
+                      :class="{ saved: message.challengeSaved }"
+                      :disabled="message.challengeSaved"
+                      @click="confirmChallengeDraft(message)"
+                    >
+                      <Check
+                        v-if="message.challengeSaved"
+                        :size="11" /><Trophy v-else :size="11" />{{
+                        message.challengeSaved
+                          ? "挑战已开始"
+                          : `确认开始 ${message.challengeDraft.days} 天挑战`
+                      }}
+                    </button>
+                  </div>
+                </div>
               </div>
             </div>
             <div v-if="chatBusy" class="chat-message assistant">
@@ -3301,6 +3586,12 @@ onMounted(() => {
                 </button>
                 <button class="loop-chip map" @click="openMap(topic)">
                   <MapIcon :size="12" />掌握 {{ masteryPercentOf(topic.id) }}%
+                  <i
+                    v-if="topicDraftCount(topic.id)"
+                    class="loop-badge"
+                    aria-label="有 Pi 起草的卡片待确认"
+                    >{{ topicDraftCount(topic.id) }}</i
+                  >
                 </button>
               </div>
               <div v-if="topic.nextStep" class="topic-next">
@@ -4018,6 +4309,9 @@ onMounted(() => {
             </div>
             <small v-if="pdcaAiBusy" class="pdca-hint">循环执行中…</small>
           </div>
+          <button type="button" class="chat-save" @click="draftCardsFromEvent()">
+            <Sparkles :size="11" />让 Pi 把这些记录起草成复习卡
+          </button>
           <div class="dialog-actions">
             <button type="button" class="cancel-button" @click="closePdca()">
               完成</button

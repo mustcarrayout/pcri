@@ -419,4 +419,8 @@ body{padding:env(safe-area-inset-top) env(safe-area-inset-right) env(safe-area-i
 .map-card-form{display:grid;gap:7px;padding-top:4px;border-top:1px dashed #e4e8df}
 .map-draft{display:flex;align-items:center;gap:8px;padding:7px 9px;border:1px dashed #b4c493;border-radius:8px;background:#f8fbef;font-size:12px}
 .map-draft span{flex:1;min-width:0;overflow:hidden;font-size:12px;text-overflow:ellipsis;white-space:nowrap}
+.loop-badge{display:inline-flex;min-width:14px;height:14px;padding:0 4px;align-items:center;justify-content:center;border-radius:7px;background:#4d719b;color:#fff;font-size:9px;font-style:normal;line-height:1}
+.chat-challenge{display:grid;gap:4px;padding:7px 9px;border:1px dashed #b4c493;border-radius:10px;background:#f8fbef}
+.chat-challenge-title{display:flex;align-items:center;gap:5px;margin:0;font-size:11px;font-weight:600;color:#55703a}
+.chat-challenge-note{margin:0;font-size:10px;color:#79837a}
 @media(max-width:620px){.loop-review-go{min-height:44px;font-size:14px}.map-add{grid-template-columns:1fr auto}.map-add .primary-button{grid-column:1/-1}.review-grades .grade{min-height:48px}}
