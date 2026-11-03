@@ -1485,11 +1485,6 @@ const PI_TOOLS = [
             type: "number",
             description: "挑战天数，7-365；不填默认 100",
           },
-          threshold: {
-            type: "string",
-            enum: ["one_event", "minutes"],
-            description: "每日打卡门槛；默认 one_event=每天至少完成 1 个该主题事项",
-          },
           goal_note: {
             type: "string",
             description: "目标笔记：挑战成功后用户能用这个主题做成什么，一句话",
@@ -1889,6 +1884,11 @@ const pointStatusNames: Record<PointStatus, string> = {
   touched: "已接触",
   shaky: "边缘",
   mastered: "已掌握",
+};
+/** 挑战确认卡展示每日门槛(Pi 侧固定 one_event;minutes 结算未生效,FSD §12-2) */
+const challengeThresholdNames: Record<"one_event" | "minutes", string> = {
+  one_event: "每天至少完成 1 个该主题的事项",
+  minutes: "累计学习分钟数",
 };
 const bloomNames: Record<BloomLevel, string> = {
   recall: "能复述",
@@ -2419,11 +2419,17 @@ function toolCreateChallenge(
       error: "该主题已有进行中的挑战",
       note: "不要生成确认卡;告知用户已有进行中的挑战,可先继续或放弃后再开新的。",
     };
+  // 一次只挂一张待确认卡:多张时后到的丢弃会造成模型与界面状态不一致(#8 复核修正)
+  if (drafts.length)
+    return {
+      error: "本轮对话已有一张待确认的挑战卡,未为本主题生成新卡",
+      note: "告知用户:先确认手头这张挑战卡,之后可以再开下一个主题的挑战。",
+    };
   const normalized = normalizeChallengeSuggestion({
     topicId: topic.id,
     topicTitle: topic.title,
     days: args.days,
-    threshold: args.threshold,
+    // 不透传 threshold:minutes 门槛结算未生效(FSD §12-2),Pi 侧固定 one_event
     goalNote: String(args.goal_note || ""),
   });
   if ("error" in normalized) return { error: normalized.error };
@@ -2497,6 +2503,8 @@ function toolChallengeReminder(args: Record<string, unknown>): Record<string, un
   if (!body)
     return { error: "summary 为必填:用一句提醒语气的话概括今天的学习状态" };
   const cached = cacheLoopReminderCopy(LOOP_REMINDER_TITLE, body);
+  // 同日已按静态文案排入的 9200 通知要立即重排,当晚 21:00 才会用上新文案(#8 复核修正)
+  void syncLoopNotifications();
   return {
     ok: true,
     title: cached.title,
@@ -3478,6 +3486,11 @@ onMounted(() => {
                       <Trophy :size="12" />百日挑战「{{
                         message.challengeDraft.topicTitle
                       }}」· {{ message.challengeDraft.days }} 天
+                    </p>
+                    <p class="chat-challenge-note">
+                      每日门槛：{{
+                        challengeThresholdNames[message.challengeDraft.threshold]
+                      }}
                     </p>
                     <p
                       v-if="message.challengeDraft.goalNote"
