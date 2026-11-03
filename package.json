@@ -7,6 +7,7 @@
     "dev": "vite --host 0.0.0.0",
     "build": "vite build",
     "typecheck": "vue-tsc --noEmit",
+    "test:loop": "esbuild test/loop-smoke.ts --bundle --format=esm --platform=node --alias:@capacitor/core=./test/stubs/core.mjs --alias:@capacitor-community/sqlite=./test/stubs/sqlite.mjs --outfile=node_modules/.cache/loop-smoke.mjs && node node_modules/.cache/loop-smoke.mjs",
     "android:add": "cap add android",
     "android:sync": "npm run build && cap sync android",
     "android:open": "cap open android"

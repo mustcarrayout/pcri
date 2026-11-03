@@ -26,84 +26,45 @@
 ## 2. 数据模型(SQLite,Android 真身;浏览器降级用 localStorage 模拟)
 
 ```sql
--- 挑战定义
-CREATE TABLE challenge (
-  id           TEXT PRIMARY KEY,
-  topic_id     TEXT NOT NULL,        -- 绑定学习主题(单主题)
-  start_date   TEXT NOT NULL,        -- YYYY-MM-DD,本地时区
-  total_days   INTEGER NOT NULL,     -- 默认 100,可选 21/30/66/100
-  threshold    TEXT NOT NULL,        -- 'one_event' | 'minutes'
-  threshold_minutes INTEGER,         -- threshold='minutes' 时生效
+-- As-built:与 src/learningLoop.ts 的 SCHEMA 常量逐字对齐(loop_ 前缀避免与事件表混淆)
+CREATE TABLE IF NOT EXISTS loop_challenge (
+  id TEXT PRIMARY KEY NOT NULL, topic_id TEXT NOT NULL, topic_title TEXT NOT NULL,
+  start_date TEXT NOT NULL, total_days INTEGER NOT NULL,
+  threshold TEXT NOT NULL, threshold_minutes INTEGER,
   freezes_left INTEGER NOT NULL DEFAULT 2,
-  status       TEXT NOT NULL DEFAULT 'active',
-               -- active | paused | finished | abandoned
-  created_at   TEXT NOT NULL,
-  updated_at   TEXT NOT NULL
+  status TEXT NOT NULL DEFAULT 'active', settled_on TEXT NOT NULL DEFAULT ''
 );
-
--- 打卡记录(显式落表;miss 不落表)
-CREATE TABLE challenge_checkin (
-  id           TEXT PRIMARY KEY,
-  challenge_id TEXT NOT NULL REFERENCES challenge(id),
-  date         TEXT NOT NULL,        -- 归属挑战日(补签时 ≠ created 日期)
-  kind         TEXT NOT NULL,        -- 'event' | 'light' | 'freeze'
-  event_id     TEXT,                 -- kind='event' 时关联
-  note_id      TEXT,                 -- 轻打卡的 PDCA/转录引用
-  created_at   TEXT NOT NULL,
-  UNIQUE(challenge_id, date)         -- 每挑战日最多一条
+CREATE TABLE IF NOT EXISTS loop_checkin (
+  id TEXT PRIMARY KEY NOT NULL, challenge_id TEXT NOT NULL, date TEXT NOT NULL,
+  kind TEXT NOT NULL, event_id TEXT, note_id TEXT,
+  UNIQUE(challenge_id, date)
 );
-
--- 知识点(掌握地图节点)
-CREATE TABLE knowledge_point (
-  id           TEXT PRIMARY KEY,
-  topic_id     TEXT NOT NULL,
-  name         TEXT NOT NULL,
-  bloom_level  TEXT NOT NULL,        -- 'recall' | 'explain' | 'apply' | 'create'
-  mastery      REAL NOT NULL DEFAULT 0,       -- BKT 掌握概率
-  status       TEXT NOT NULL DEFAULT 'dark',  -- dark | touched | shaky | mastered
-  last_evidence_at TEXT,
-  created_at   TEXT NOT NULL,
-  updated_at   TEXT NOT NULL,
+CREATE TABLE IF NOT EXISTS loop_point (
+  id TEXT PRIMARY KEY NOT NULL, topic_id TEXT NOT NULL, name TEXT NOT NULL,
+  bloom_level TEXT NOT NULL, mastery REAL NOT NULL DEFAULT 0,
+  status TEXT NOT NULL DEFAULT 'dark', last_evidence_at TEXT,
   UNIQUE(topic_id, name)
 );
-
--- 复习卡
-CREATE TABLE review_card (
-  id           TEXT PRIMARY KEY,
-  topic_id     TEXT NOT NULL,
-  point_id     TEXT REFERENCES knowledge_point(id),  -- 手动建卡可为空
-  source_type  TEXT NOT NULL,        -- 'pdca' | 'transcript' | 'reflection' | 'manual'
-  source_id    TEXT NOT NULL,        -- 锚定的事件笔记/转录,保证可溯源
-  front        TEXT NOT NULL,
-  back         TEXT NOT NULL,
-  ease         REAL NOT NULL DEFAULT 2.5,     -- SM-2 EF,范围 [1.3, 3.0]
-  interval_days REAL NOT NULL DEFAULT 0,
-  due_date     TEXT NOT NULL,
-  status       TEXT NOT NULL DEFAULT 'active',
-               -- draft | active | suspended | archived
-  created_at   TEXT NOT NULL,
-  updated_at   TEXT NOT NULL
+CREATE TABLE IF NOT EXISTS loop_card (
+  id TEXT PRIMARY KEY NOT NULL, topic_id TEXT NOT NULL, point_id TEXT,
+  source_type TEXT NOT NULL, source_id TEXT NOT NULL, source_title TEXT NOT NULL DEFAULT '',
+  front TEXT NOT NULL, back TEXT NOT NULL,
+  ease REAL NOT NULL DEFAULT 2.5, interval_days REAL NOT NULL DEFAULT 0,
+  due_date TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'draft'
 );
-
--- 复习日志
-CREATE TABLE review_log (
-  id           TEXT PRIMARY KEY,
-  card_id      TEXT NOT NULL REFERENCES review_card(id),
-  reviewed_at  TEXT NOT NULL,
-  grade        TEXT NOT NULL         -- 'forgot' | 'fuzzy' | 'recall'
+CREATE TABLE IF NOT EXISTS loop_review_log (
+  id TEXT PRIMARY KEY NOT NULL, card_id TEXT NOT NULL,
+  reviewed_at TEXT NOT NULL, grade TEXT NOT NULL
 );
-
--- 教回评估结果
-CREATE TABLE teachback_log (
-  id           TEXT PRIMARY KEY,
-  topic_id     TEXT NOT NULL,
-  transcript_id TEXT NOT NULL,       -- 语音转录引用
-  result_json  TEXT NOT NULL,        -- [{point_id, covered, quote}]
-  created_at   TEXT NOT NULL
+CREATE TABLE IF NOT EXISTS loop_teachback (
+  id TEXT PRIMARY KEY NOT NULL, topic_id TEXT NOT NULL, transcript_id TEXT NOT NULL,
+  result_json TEXT NOT NULL, created_at TEXT NOT NULL
 );
 ```
 
-索引:`challenge(topic_id, status)`、`review_card(due_date, status)`、`review_log(card_id, reviewed_at)`。
+- `loop_challenge.settled_on`:daily_settle 的幂等标记(已结算到的"结算执行日"),见 §3.3 与 §12-1。
+- `loop_checkin` 无 created_at:归属日即业务时间,补签由 `date` 字段表达。
+- 索引:P0 不建显式索引——个人规模数据整表加载进内存、规则在应用层计算;数据量上来后再补。
 
 ## 3. 百日挑战规格
 
@@ -238,8 +199,8 @@ draft ──用户确认──▶ active ──用户暂停──▶ suspended �
 
 ## 7. 通知规格(汇总)
 
-- 每日 ≤2 条;22:30 后不推送;时段用户可配。
-- 优先级:红线询问 > 冻结告知 > 挑战提醒 / 复习提醒(当日只发一条复习或挑战提醒,按 due 与门槛状态择一)。
+- As-built(P0):单条复习提醒,每日 21:00(通知 ID 9200 段,与定时服务 9100 段隔离),仅当存在活跃挑战或激活卡时安排;冻结告知与红线暂停以 App 内 Pi 消息即时呈现(不额外占通知额度)。
+- 规划(可迭代到 ≤2 条):挑战提醒 21:30 与复习提醒按 due/门槛状态择一;时段用户可配;红线询问升级为系统通知。见 issue「P1 通知择一与时段配置」。
 
 ## 8. 分享卡片(P1)
 
@@ -264,3 +225,14 @@ SQLite → localStorage 模拟;本地通知 → 不发(控制台提示);语音�
 4. 通知每日 ≤2 条、22:30 后不触发、时段可配。
 5. 任何闭环写入不修改日历事件本体;钉钉 `work` 事件不参与判定。
 6. `daily_settle` 幂等:同一天重复执行不产生重复行或重复通知。
+
+## 12. As-built 实现差异记录(P0)
+
+实现以 `src/learningLoop.ts` + `CalendarApp.vue` 为准(commit 651dad5 起),与上文规格的差异:
+
+1. **结算幂等标记落库**(§3.3):`challenge.settled_on` 字段记录"当天已结算",跨多天未打开 App 时只结算昨日一天(简化;连续多天缺席的累积判定由红线回数循环覆盖)。
+2. **实时打卡匹配规则**(§3.3):以「事件标题包含主题名 / 标签等于主题名或 goalTag」判定关联,且显式排除 `work` 类别(钉钉事件不参与);`minutes` 门槛模式模块已支持、UI 未暴露,默认 `one_event`。
+3. **通知策略**(§7):P0 为单条静态复习提醒 21:00;"择一触发"与时段配置延后。
+4. **Pi 工具**(§6):P0 仅落地数据层与手动入口;`create_challenge` 目标笔记起草、`draft_cards`、`assess_teachback`、`frontier_report` 等未接入对话流,卡片草稿面板已就绪待 Pi 产出。
+5. **里程碑徽标**(§3.3):连续天数已在数据层可算(`challengeStreak`),徽标 UI 与 finished 达成标记呈现待补。
+6. **smoke 测试**:`npm run test:loop`(esbuild 打桩电容模块)35 项断言覆盖 §11 全部规则类验收。

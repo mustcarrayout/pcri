@@ -1837,6 +1837,7 @@ function bumpLoop() {
 }
 /** 事件勾选完成时,给标题/标签能对上的主题记一次挑战打卡 */
 function recordLoopCheckin(event: CalendarEvent) {
+  if (event.category === "work") return; // PRD 非目标:钉钉/工作事件不参与学习闭环
   for (const topic of topics.value) {
     const related =
       event.tags.includes(topic.title) ||
