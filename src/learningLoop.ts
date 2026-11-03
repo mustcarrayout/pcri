@@ -1037,3 +1037,45 @@ export function pendingDraftCount(topicId?: string): number {
     (item) => item.status === "draft" && (!topicId || item.topicId === topicId),
   ).length;
 }
+
+// ── 启动零摩擦(FSD §14,issue #16)──
+
+export type NextActionSource = "review" | "micro" | "reteach";
+
+export type NextAction =
+  | { source: "review"; cardId: string; micro: string }
+  | { source: "micro"; cardId: null; micro: string }
+  | { source: "reteach"; cardId: null; micro: string };
+
+/** nextStep 的 2 分钟微版:首句截断(。;;!!??…或换行切分),无句读整段截 40 字 */
+export function microStepOf(nextStep: string): string {
+  const text = (nextStep || "").trim();
+  if (!text) return "";
+  return text
+    .split(/[。;;!!??…\n]/)[0]
+    .trim()
+    .slice(0, 40);
+}
+
+/**
+ * 每个非搁置主题任意时刻恰好一个「现在就做」(纯函数):
+ * 到期复习卡 > nextStep 的 2 分钟微版 > 教回差距「再讲」;三档皆无返回 null。
+ * 复习档取 buildDailyQueue(topicId) 首张,不建事件不计时。
+ */
+export function resolveNextAction(
+  topicId: string,
+  input: {
+    nextStep?: string;
+    lastGap?: { level?: string; gaps?: string } | null;
+  },
+): NextAction | null {
+  const queue = buildDailyQueue(topicId);
+  if (queue.length)
+    return { source: "review", cardId: queue[0].card.id, micro: "" };
+  const micro = microStepOf(input.nextStep || "");
+  if (micro) return { source: "micro", cardId: null, micro };
+  const gap = input.lastGap;
+  if (gap && gap.level !== "solid" && (gap.gaps || "").trim())
+    return { source: "reteach", cardId: null, micro: "" };
+  return null;
+}

@@ -1,6 +1,7 @@
 // 学习闭环纯逻辑冒烟测试(esbuild 打桩 @capacitor/* 后在 Node 运行)
 // 覆盖 FSD P0 验收清单中的规则部分:幂等结算、冻结、补签、SM-2、BKT 四态、队列截断
 // 以及 §6.1 Issue #8:Pi 三工具纯逻辑(草稿规整/确认幂等/来源读取/批量校验/文案选择/goal_note 迁移)
+// 以及 §14 Issue #16:启动零摩擦(microStepOf/resolveNextAction/轻打卡幂等依赖)
 import * as loop from "../src/learningLoop";
 import { native } from "./stubs/core.mjs";
 import { fakeDb } from "./stubs/sqlite.mjs";
@@ -486,9 +487,121 @@ async function piToolTests() {
   );
 }
 
+// ══ FSD §14 Issue #16:启动零摩擦纯逻辑 ══
+async function zeroFrictionTests() {
+  // 1) microStepOf:首句截断 / 无句读长句 ≤40 / 空串
+  ok(
+    loop.microStepOf("读第 3 章。做完课后习题") === "读第 3 章",
+    "microStepOf 取首句",
+    loop.microStepOf("读第 3 章。做完课后习题"),
+  );
+  const longStep = "这是一个没有任何句读特别长的下一步描述需要被截断到四十个字以内".repeat(2);
+  const longMicro = loop.microStepOf(longStep);
+  ok(
+    longMicro.length === 40 && longMicro === longStep.slice(0, 40),
+    "无句读长句截断至 40 字",
+    longMicro.length,
+  );
+  ok(
+    loop.microStepOf("") === "" && loop.microStepOf("   ") === "",
+    "空串 microStepOf → 空串",
+  );
+
+  // 2) resolveNextAction 优先级
+  const t = "t-f10";
+  const f10card = loop.createCard({
+    topicId: t,
+    pointId: null,
+    sourceType: "manual",
+    sourceId: `manual:${today}`,
+    sourceTitle: "F10",
+    front: "零摩擦卡",
+    back: "答案",
+    active: true,
+  });
+  ok(!("error" in f10card), "#16 建到期卡(active,due=今日)");
+  const f10cardR = f10card as Exclude<typeof f10card, { error: string }>;
+  const dueAction = loop.resolveNextAction(t, {
+    nextStep: "读第 3 章",
+    lastGap: null,
+  });
+  ok(
+    dueAction?.source === "review",
+    "存在到期卡时 review 优先(即使有 nextStep)",
+    dueAction,
+  );
+  ok(
+    dueAction?.source === "review" &&
+      dueAction.cardId === loop.buildDailyQueue(t)[0]?.card.id,
+    "review 的 cardId 等于 buildDailyQueue 首张",
+    dueAction,
+  );
+  loop.archiveCard(f10cardR.id);
+  const microAction = loop.resolveNextAction(t, {
+    nextStep: "读第 3 章。做完课后习题",
+    lastGap: { level: "lost", gaps: "讲不出来" },
+  });
+  ok(
+    microAction?.source === "micro" && microAction.micro === "读第 3 章",
+    "无到期卡且 nextStep 非空 → micro(微版取首句)",
+    microAction,
+  );
+  const reteachAction = loop.resolveNextAction(t, {
+    nextStep: "",
+    lastGap: { level: "shaky", gaps: "没讲清 p 值" },
+  });
+  ok(
+    reteachAction?.source === "reteach",
+    "nextStep 为空 + 教回差距 → reteach",
+    reteachAction,
+  );
+  ok(
+    loop.resolveNextAction(t, { nextStep: "", lastGap: null }) === null,
+    "三者皆无 → null",
+  );
+
+  // 3) 第三档边界:level='solid' 或 gaps 为空不产生 re-teach
+  ok(
+    loop.resolveNextAction(t, {
+      nextStep: "",
+      lastGap: { level: "solid", gaps: "有差距但已讲清" },
+    }) === null,
+    "lastGap.level='solid' 不产生 reteach",
+  );
+  ok(
+    loop.resolveNextAction(t, {
+      nextStep: "",
+      lastGap: { level: "shaky", gaps: "   " },
+    }) === null,
+    "gaps 为空不产生 reteach",
+  );
+
+  // 4) 微版完成幂等依赖:当日已有 kind='event' 打卡行时,结束流程调 lightCheckin 被拒且不落第二行
+  const f10ch = loop.createChallenge({ topicId: t, topicTitle: "零摩擦挑战" });
+  ok(!("error" in f10ch), "#16 创建挑战(默认今日起始)");
+  const f10chr = f10ch as Exclude<typeof f10ch, { error: string }>;
+  loop.recordEventDone(t, today, "e-f10");
+  ok(
+    loop.challengeProgress(f10chr).doneCount === 1,
+    "前置:事件完成已落 kind='event' 打卡",
+  );
+  const rejected = loop.lightCheckin(f10chr.id);
+  ok(
+    rejected === "今天已有打卡记录",
+    "当日已有 event 打卡时 lightCheckin 被拒",
+    rejected,
+  );
+  ok(
+    loop.challengeProgress(f10chr).doneCount === 1 &&
+      loop.challengeProgress(f10chr).freezeCount === 0,
+    "被拒后不落第二行(轻打卡也不产生)",
+  );
+}
+
 void (async () => {
   try {
     await piToolTests();
+    await zeroFrictionTests();
   } catch (error) {
     fail += 1;
     console.log("  FAIL Pi 工具用例异常", error);

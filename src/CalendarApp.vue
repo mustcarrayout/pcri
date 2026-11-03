@@ -36,9 +36,11 @@ import {
   extractLoopCardSources,
   hasLoopActivity,
   initLoopStorage,
+  lightCheckin,
   loadLoopReminderCopy,
   normalizeChallengeSuggestion,
   normalizePiCardBatch,
+  resolveNextAction,
   pendingDraftCount,
   pickLoopReminderCopy,
   recordEventDone,
@@ -52,6 +54,7 @@ import {
   type Challenge,
   type ChallengeProgress,
   type ChallengeSuggestion,
+  type NextAction,
   type PointStatus,
   type QueueEntry,
   type ReviewGrade,
@@ -106,6 +109,8 @@ interface CalendarEvent {
   urgent: boolean;
   voiceNote: string;
   reflection: string;
+  /** 2 分钟微版(FSD §14,#16):plan_goal 任务可带;「现在就做」事件承载派生微版 */
+  micro: string;
   pdca: Record<Step, string>;
 }
 interface ChatMessage {
@@ -488,6 +493,9 @@ const weekReviewCount = computed(() => {
 const pdcaEventTitle = computed(
   () => events.value.find((event) => event.id === pdcaTargetId.value)?.title || "",
 );
+const pdcaEvent = computed(
+  () => events.value.find((event) => event.id === pdcaTargetId.value) || null,
+);
 const currentStep = computed(
   () => steps.find((step) => step.id === pdcaStage.value) || steps[0],
 );
@@ -598,6 +606,7 @@ function demoEvents(): CalendarEvent[] {
       urgent: true,
       voiceNote: "",
       reflection: "",
+      micro: "",
       pdca: { plan: "对齐本周迭代目标", do: "", check: "", act: "" },
     },
     {
@@ -613,6 +622,7 @@ function demoEvents(): CalendarEvent[] {
       urgent: false,
       voiceNote: "",
       reflection: "",
+      micro: "",
       pdca: { plan: "轻松完成 5 公里，不追配速", do: "", check: "", act: "" },
     },
     {
@@ -628,6 +638,7 @@ function demoEvents(): CalendarEvent[] {
       urgent: false,
       voiceNote: "",
       reflection: "比计划多读了 5 分钟，睡前阅读很适合我。",
+      micro: "",
       pdca: {
         plan: "睡前读完一章",
         do: "完成第三章",
@@ -672,6 +683,7 @@ async function openDatabase() {
         voice_note: "TEXT NOT NULL DEFAULT ''",
         reflection: "TEXT NOT NULL DEFAULT ''",
         external_id: "TEXT NOT NULL DEFAULT ''",
+        micro: "TEXT NOT NULL DEFAULT ''",
       })) {
         if (!existingColumns.has(column))
           await nativeDb.execute(
@@ -697,6 +709,7 @@ async function openDatabase() {
         urgent: Boolean(row.urgent),
         voiceNote: String(row.voice_note || ""),
         reflection: String(row.reflection || ""),
+        micro: String(row.micro || ""),
         pdca: {
           plan: String(row.pdca_plan || ""),
           do: String(row.pdca_do || ""),
@@ -712,9 +725,14 @@ async function openDatabase() {
     }
   } else {
     try {
-      events.value = JSON.parse(
+      const parsed = JSON.parse(
         localStorage.getItem(eventsKey) || "[]",
       ) as CalendarEvent[];
+      // 旧演示数据缺 micro 字段:读补空串(#16)
+      events.value = (Array.isArray(parsed) ? parsed : []).map((item) => ({
+        ...item,
+        micro: typeof item.micro === "string" ? item.micro : "",
+      }));
     } catch {
       events.value = [];
     }
@@ -732,7 +750,7 @@ async function saveEvents() {
       // 逐行 upsert，替代整表清空重写：单行失败不再丢全部数据
       for (const event of events.value)
         await db.value.run(
-          `INSERT OR REPLACE INTO calendar_events (id,title,date,time,category,tags,source,done,important,urgent,voice_note,reflection,pdca_plan,pdca_do,pdca_check,pdca_act,external_id) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+          `INSERT OR REPLACE INTO calendar_events (id,title,date,time,category,tags,source,done,important,urgent,voice_note,reflection,micro,pdca_plan,pdca_do,pdca_check,pdca_act,external_id) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
           [
             event.id,
             event.title,
@@ -746,6 +764,7 @@ async function saveEvents() {
             event.urgent ? 1 : 0,
             event.voiceNote,
             event.reflection,
+            event.micro || "",
             event.pdca.plan,
             event.pdca.do,
             event.pdca.check,
@@ -1125,6 +1144,7 @@ async function runDingTalkSync(): Promise<boolean> {
           urgent: false,
           voiceNote: "",
           reflection: "",
+          micro: "",
           pdca: { plan: "", do: "", check: "", act: "" },
           externalId: item.externalId,
         });
@@ -1238,7 +1258,7 @@ async function postModelChat(
 }
 // Pi 工具驱动：模型通过工具读写日历，App 本地执行；写入类操作经确认卡落库
 const PI_AGENT_PROMPT =
-  "你是学习教练，驾驶一个以「学习主题」为核心的 App：日历只是主题在时间里的投影。create_topic 建主题（先问清楚为什么学、在哪用）；update_topic 推进主题状态（在学→能用→能教：能脱稿讲清=能用，能用且真的用过=能教）和下一步；plan_goal 把主题拆成 2-8 个任务（每件 30-90 分钟）写入日历，共用「目标·主题名」标签；query_day 查日程；propose_event 建议新事项；propose_pdca 为事项写 PDCA；start_feynman 用费曼检验用户是否真的学会了；save_feynman_result 记录结果（自动挂到主题证据链）；create_challenge 给学习主题发起百日挑战（问清天数和一句目标笔记，生成确认卡，用户点确认才开始）；draft_cards 把已有事项的记录起草成复习卡（两步：先只传 event_title 读素材，再带 cards 数组交草稿，用户在掌握地图确认）；challenge_reminder 在一天学习收尾时，用一句提醒语气的话概括当日状态，作为今晚复习提醒的文案。你的职责是推着每个主题往前走：讲过（费曼）和用过（完成任务）才算证据，没有证据就不要说用户学会了。学习档案里上次的差距，是这次对话的起点。";
+  "你是学习教练，驾驶一个以「学习主题」为核心的 App：日历只是主题在时间里的投影。create_topic 建主题（最多问一个问题，且必须同时给出第一次动手任务写进 next_step，让用户创建完就能立刻做 2 分钟）；update_topic 推进主题状态（在学→能用→能教：能脱稿讲清=能用，能用且真的用过=能教）和下一步；plan_goal 把主题拆成 2-8 个任务（每件 30-90 分钟）写入日历，共用「目标·主题名」标签，每个任务给出 2 分钟微版 micro；query_day 查日程；propose_event 建议新事项；propose_pdca 为事项写 PDCA；start_feynman 用费曼检验用户是否真的学会了；save_feynman_result 记录结果（自动挂到主题证据链）；create_challenge 给学习主题发起百日挑战（问清天数和一句目标笔记，生成确认卡，用户点确认才开始）；draft_cards 把已有事项的记录起草成复习卡（两步：先只传 event_title 读素材，再带 cards 数组交草稿，用户在掌握地图确认）；challenge_reminder 在一天学习收尾时，用一句提醒语气的话概括当日状态，作为今晚复习提醒的文案。你的职责是推着每个主题往前走：讲过（费曼）和用过（完成任务）才算证据，没有证据就不要说用户学会了。学习档案里上次的差距，是这次对话的起点。";
 const PI_TOOLS = [
   {
     type: "function",
@@ -1317,15 +1337,20 @@ const PI_TOOLS = [
     function: {
       name: "create_topic",
       description:
-        "创建学习主题（应用的核心实体）。用户表达「我想学 X /我要掌握 X」时调用；创建前先问清楚为什么学、打算在哪用——答不上来就先帮用户找一个用例，别急着建。",
+        "创建学习主题（应用的核心实体）。用户表达「我想学 X /我要掌握 X」时调用；最多问一个问题，且必须同时给出第一次动手任务（next_step）——让用户创建完就能立刻动手 2 分钟，不要连环追问为什么学、在哪用。",
       parameters: {
         type: "object",
         properties: {
           title: { type: "string", description: "主题名（简短、可辨识）" },
-          why: { type: "string", description: "为什么学，一句话" },
+          why: { type: "string", description: "为什么学，一句话；没问到就留空" },
           use_case: {
             type: "string",
-            description: "打算在哪里用它，一句话",
+            description: "打算在哪里用它，一句话；没问到就留空",
+          },
+          next_step: {
+            type: "string",
+            description:
+              "第一次动手任务：现在就能做 2 分钟的具体一步，如「读第 3 章」",
           },
         },
         required: ["title"],
@@ -1439,6 +1464,11 @@ const PI_TOOLS = [
                 plan: {
                   type: "string",
                   description: "这个任务的做法/方法论，写入它的 PDCA 计划",
+                },
+                micro: {
+                  type: "string",
+                  description:
+                    "这个任务的 2 分钟微版：第一次动手时最小的一步，让用户当天就能开始",
                 },
               },
               required: ["title", "offset_days", "plan"],
@@ -1612,6 +1642,7 @@ async function toolPlanGoal(
       urgent: false,
       voiceNote: "",
       reflection: "",
+      micro: String(task.micro || "").trim().slice(0, 120),
       pdca: {
         plan: String(task.plan || "").trim(),
         do: "",
@@ -1935,9 +1966,12 @@ function dueCount() {
 function bumpLoop() {
   loopTick.value += 1;
 }
+/** 微版标签(#16):带该标签的事件完成不计 event 打卡,轻打卡由「现在就做」结束流程显式调用 */
+const MICRO_TAG = "微版";
 /** 事件勾选完成时,给标题/标签能对上的主题记一次挑战打卡 */
 function recordLoopCheckin(event: CalendarEvent) {
   if (event.category === "work") return; // PRD 非目标:钉钉/工作事件不参与学习闭环
+  if (event.tags.includes(MICRO_TAG)) return; // #16:微版起步零门槛,完成走结束流程的 lightCheckin
   for (const topic of topics.value) {
     const related =
       event.tags.includes(topic.title) ||
@@ -2040,6 +2074,135 @@ function discardDraftCard(id: string) {
 function topicDraftCount(topicId: string) {
   void loopTick.value;
   return pendingDraftCount(topicId);
+}
+// ── 「现在就做」常驻条(FSD §14,#16):一次点击开始并计时;计时态仅内存不落库 ──
+interface NowItem {
+  topic: LearningTopic;
+  action: NextAction;
+}
+const nowRunning = ref<{
+  topicId: string;
+  eventId: string;
+  startedAt: number;
+} | null>(null);
+const nowTick = ref(0);
+let nowInterval: ReturnType<typeof setInterval> | null = null;
+/** 教回差距:learningLog 最近一条该主题记录(经标题匹配),level 与 gaps 交给 resolveNextAction 判定 */
+function lastGapOf(topic: LearningTopic): {
+  level: string;
+  gaps: string;
+} | null {
+  for (let i = learningLog.value.length - 1; i >= 0; i -= 1) {
+    const item = learningLog.value[i];
+    if (
+      item.topic === topic.title ||
+      topic.title.includes(item.topic) ||
+      item.topic.includes(topic.title)
+    )
+      return { level: item.level, gaps: item.gaps };
+  }
+  return null;
+}
+const nowItems = computed<NowItem[]>(() => {
+  void loopTick.value;
+  return topics.value
+    .filter((topic) => topic.status !== "paused")
+    .map((topic) => ({
+      topic,
+      action: resolveNextAction(topic.id, {
+        nextStep: topic.nextStep,
+        lastGap: lastGapOf(topic),
+      }),
+    }))
+    .filter((item): item is NowItem => item.action !== null);
+});
+function nowActionLabel(action: NextAction) {
+  if (action.source === "review") return "复习到期卡";
+  return action.source === "micro" ? "2 分钟起步" : "2 分钟再讲";
+}
+const nowElapsedLabel = computed(() => {
+  void nowTick.value;
+  const running = nowRunning.value;
+  if (!running) return "";
+  const seconds = Math.max(0, Math.floor((Date.now() - running.startedAt) / 1000));
+  return `${String(Math.floor(seconds / 60)).padStart(2, "0")}:${String(
+    seconds % 60,
+  ).padStart(2, "0")}`;
+});
+function beginNowTimer(topicId: string, eventId: string) {
+  if (nowRunning.value) return; // 单一计时槽:进行中不重复创建/不切换
+  nowRunning.value = { topicId, eventId, startedAt: Date.now() };
+  if (!nowInterval)
+    nowInterval = setInterval(() => {
+      nowTick.value += 1;
+    }, 1000);
+}
+function startNow(item: NowItem) {
+  if (nowRunning.value) return; // 条上呈现进行中态;重复点击不建第二个事件
+  if (item.action.source === "review") {
+    openReview(); // 既有复习弹窗:不建事件不计时(#16 边界)
+    return;
+  }
+  const micro =
+    item.action.source === "micro"
+      ? item.action.micro
+      : `2 分钟再讲:${lastGapOf(item.topic)?.gaps || item.topic.nextStep}`.slice(
+          0,
+          120,
+        );
+  const title =
+    item.action.source === "micro"
+      ? `2 分钟起步·${item.topic.title}`
+      : `再讲一次·${item.topic.title}`;
+  const started = new Date();
+  const event: CalendarEvent = {
+    id: crypto.randomUUID(),
+    title,
+    date: today.value,
+    time: `${String(started.getHours()).padStart(2, "0")}:${String(
+      started.getMinutes(),
+    ).padStart(2, "0")}`,
+    category: "plan",
+    tags: [...new Set([item.topic.title, MICRO_TAG])],
+    source: "personal",
+    done: false,
+    important: false,
+    urgent: false,
+    voiceNote: "",
+    reflection: "",
+    micro,
+    pdca: { plan: "", do: "", check: "", act: "" },
+  };
+  events.value.push(event);
+  void saveEvents();
+  beginNowTimer(item.topic.id, event.id);
+}
+/** 结束:事件置 done→有活跃挑战则显式轻打卡(当日已有打卡由 lightCheckin 自身拒绝)→PDCA 定位 Do 段 */
+function finishNow() {
+  const running = nowRunning.value;
+  if (!running) return;
+  if (nowInterval) {
+    clearInterval(nowInterval);
+    nowInterval = null;
+  }
+  nowRunning.value = null;
+  const event = events.value.find((item) => item.id === running.eventId);
+  if (!event) return;
+  event.done = true;
+  void saveEvents();
+  if (running.topicId) {
+    const challenge = activeChallengeForTopic(running.topicId);
+    if (challenge) lightCheckin(challenge.id);
+  }
+  openPdca(event, "do");
+  pdcaHint.value = "这 2 分钟做了什么?写一句 Do,或按住麦克风说 15 秒。";
+  bumpLoop();
+}
+/** 事件详情「先做 2 分钟」:对既有事件走同一计时流程,不新建事件(#16 验收 3) */
+function startMicroFromEvent() {
+  const event = events.value.find((item) => item.id === pdcaTargetId.value);
+  if (!event || event.done || nowRunning.value) return;
+  beginNowTimer(matchTopicForEvent(event)?.id || "", event.id);
 }
 function openReview() {
   queue.value = buildDailyQueue();
@@ -2315,7 +2478,8 @@ function toolCreateTopic(args: Record<string, unknown>) {
   return {
     ok: true,
     topic: topic.title,
-    note: "已创建。接着问用户第一周想完成什么，用 plan_goal 拆成带「目标·」标签的事项落到日历。",
+    next_step: topic.nextStep,
+    note: "已创建，第一次动手任务已就绪。先推动用户立刻做 2 分钟起步（学习视图顶部「现在就做」），再视情况用 plan_goal 把目标拆成带「目标·」标签的事项。",
   };
 }
 function toolUpdateTopic(args: Record<string, unknown>) {
@@ -2677,6 +2841,7 @@ async function saveSuggestion(message: ChatMessage, index: number) {
     urgent: suggestion.urgent,
     voiceNote: "",
     reflection: "",
+    micro: "",
     pdca: { plan: "", do: "", check: "", act: "" },
   });
   if (!message.saved) message.saved = [];
@@ -3547,6 +3712,26 @@ onMounted(() => {
             <button class="loop-review-go" @click="openReview()">
               <Brain :size="15" />今日复习<b>{{ dueCount() }}</b>张
             </button>
+            <button
+              v-for="item in nowItems"
+              :key="item.topic.id"
+              type="button"
+              class="now-chip"
+              :class="[
+                item.action.source,
+                { running: nowRunning?.topicId === item.topic.id },
+              ]"
+              :disabled="!!nowRunning && nowRunning.topicId !== item.topic.id"
+              :aria-label="`现在就做:${item.topic.title}`"
+              @click="startNow(item)"
+            >
+              <Clock3 v-if="nowRunning?.topicId === item.topic.id" :size="11" /><Sparkles v-else :size="11" />
+              <b>{{ item.topic.title }}</b>
+              <span v-if="nowRunning?.topicId === item.topic.id"
+                >进行中 {{ nowElapsedLabel }}</span
+              >
+              <span v-else>{{ nowActionLabel(item.action) }}</span>
+            </button>
             <small>边缘优先 · 上限 {{ DAILY_QUEUE_LIMIT }} 张{{ loopBackendName ? "" : " · 存储初始化中" }}</small>
           </div>
           <div v-if="topics.length" class="topic-list">
@@ -4256,6 +4441,23 @@ onMounted(() => {
           ><span class="eyebrow">PDCA LOOP</span>
           <h2 class="pdca-title">{{ pdcaEventTitle }}</h2>
           <small v-if="pdcaHint" class="pdca-hint">{{ pdcaHint }}</small>
+          <div v-if="pdcaEvent?.micro" class="pdca-micro">
+            <span>微版：{{ pdcaEvent.micro }}</span>
+            <button
+              v-if="!pdcaEvent.done && !nowRunning"
+              type="button"
+              class="chat-save"
+              aria-label="先做 2 分钟"
+              @click="startMicroFromEvent()"
+            >
+              <Sparkles :size="11" />先做 2 分钟
+            </button>
+            <span
+              v-else-if="nowRunning?.eventId === pdcaEvent?.id"
+              class="pdca-hint"
+              >进行中 {{ nowElapsedLabel }}</span
+            >
+          </div>
           <div class="pdca-steps">
             <button
               v-for="step in steps"
