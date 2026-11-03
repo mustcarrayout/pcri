@@ -431,4 +431,13 @@ body{padding:env(safe-area-inset-top) env(safe-area-inset-right) env(safe-area-i
 .chat-challenge{display:grid;gap:4px;padding:7px 9px;border:1px dashed #b4c493;border-radius:10px;background:#f8fbef}
 .chat-challenge-title{display:flex;align-items:center;gap:5px;margin:0;font-size:11px;font-weight:600;color:#55703a}
 .chat-challenge-note{margin:0;font-size:10px;color:#79837a}
+.chat-teachback{display:grid;gap:5px;padding:7px 9px;border:1px dashed #a9b8c9;border-radius:10px;background:#f3f6fa}
+.chat-teachback-title{display:flex;align-items:center;gap:5px;margin:0;font-size:11px;font-weight:600;color:#4d6178}
+.chat-teachback-item{display:flex;align-items:flex-start;gap:6px;font-size:11px;color:#3f4a56}
+.chat-teachback-status{flex:none;padding:1px 6px;border-radius:8px;font-size:9px;line-height:1.4}
+.chat-teachback-status.ok{color:#55703a;background:#eef4e0}
+.chat-teachback-status.miss{color:#a85e48;background:#f8eae5}
+.chat-teachback-text{flex:1;min-width:0;display:grid;gap:2px}
+.chat-teachback-text i{font-style:normal;color:#79837a;font-size:10px;word-break:break-all}
+.chat-teachback-text em{font-style:normal;color:#a85e48;font-size:10px}
 @media(max-width:620px){.loop-review-go{min-height:44px;font-size:14px}.map-add{grid-template-columns:1fr auto}.map-add .primary-button{grid-column:1/-1}.review-grades .grade{min-height:48px}}

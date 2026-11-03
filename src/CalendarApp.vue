@@ -23,6 +23,8 @@ import {
   abandonChallenge,
   activeChallengeForTopic,
   addKnowledgePoint,
+  applyPointEvidence,
+  applyTeachback,
   buildDailyQueue,
   cacheLoopReminderCopy,
   challengeProgress,
@@ -43,7 +45,9 @@ import {
   resolveNextAction,
   pendingDraftCount,
   pickLoopReminderCopy,
+  pointById,
   recordEventDone,
+  resolveTeachbackResults,
   removeKnowledgePoint,
   resumeChallenge,
   scheduleCard,
@@ -121,6 +125,24 @@ interface ChatMessage {
   /** Pi create_challenge 产出的挑战确认卡;用户点确认才落库(FSD §6.1) */
   challengeDraft?: ChallengeSuggestion;
   challengeSaved?: boolean;
+  /** Pi assess_teachback 产出的教回评估草稿;用户点应用才写库(FSD §13,#9) */
+  teachbackDraft?: TeachbackDraft;
+}
+/** 教回评估草稿的展示条目(名称+引文,标摇态仅内存) */
+interface TeachbackDraftItemView {
+  pointId: string;
+  pointName: string;
+  covered: boolean;
+  quote: string;
+  marked?: boolean;
+}
+interface TeachbackDraft {
+  topicId: string;
+  topicTitle: string;
+  summary: string;
+  items: TeachbackDraftItemView[];
+  unknown: string[];
+  applied?: boolean;
 }
 interface EventSuggestion {
   title: string;
@@ -1258,7 +1280,7 @@ async function postModelChat(
 }
 // Pi 工具驱动：模型通过工具读写日历，App 本地执行；写入类操作经确认卡落库
 const PI_AGENT_PROMPT =
-  "你是学习教练，驾驶一个以「学习主题」为核心的 App：日历只是主题在时间里的投影。create_topic 建主题（最多问一个问题，且必须同时给出第一次动手任务写进 next_step，让用户创建完就能立刻做 2 分钟）；update_topic 推进主题状态（在学→能用→能教：能脱稿讲清=能用，能用且真的用过=能教）和下一步；plan_goal 把主题拆成 2-8 个任务（每件 30-90 分钟）写入日历，共用「目标·主题名」标签，每个任务给出 2 分钟微版 micro；query_day 查日程；propose_event 建议新事项；propose_pdca 为事项写 PDCA；start_feynman 用费曼检验用户是否真的学会了；save_feynman_result 记录结果（自动挂到主题证据链）；create_challenge 给学习主题发起百日挑战（问清天数和一句目标笔记，生成确认卡，用户点确认才开始）；draft_cards 把已有事项的记录起草成复习卡（两步：先只传 event_title 读素材，再带 cards 数组交草稿，用户在掌握地图确认）；challenge_reminder 在一天学习收尾时，用一句提醒语气的话概括当日状态，作为今晚复习提醒的文案。你的职责是推着每个主题往前走：讲过（费曼）和用过（完成任务）才算证据，没有证据就不要说用户学会了。学习档案里上次的差距，是这次对话的起点。";
+  "你是学习教练，驾驶一个以「学习主题」为核心的 App：日历只是主题在时间里的投影。create_topic 建主题（最多问一个问题，且必须同时给出第一次动手任务写进 next_step，让用户创建完就能立刻做 2 分钟）；update_topic 推进主题状态（在学→能用→能教：能脱稿讲清=能用，能用且真的用过=能教）和下一步；plan_goal 把主题拆成 2-8 个任务（每件 30-90 分钟）写入日历，共用「目标·主题名」标签，每个任务给出 2 分钟微版 micro；query_day 查日程；propose_event 建议新事项；propose_pdca 为事项写 PDCA；start_feynman 用费曼检验用户是否真的学会了；save_feynman_result 记录结果（自动挂到主题证据链）；create_challenge 给学习主题发起百日挑战（问清天数和一句目标笔记，生成确认卡，用户点确认才开始）；draft_cards 把已有事项的记录起草成复习卡（两步：先只传 event_title 读素材，再带 cards 数组交草稿，用户在掌握地图确认）；challenge_reminder 在一天学习收尾时，用一句提醒语气的话概括当日状态，作为今晚复习提醒的文案；assess_teachback 在用户讲完一遍后逐个知识点评估讲清与否（引原话，生成草稿等用户点应用）。你的职责是推着每个主题往前走：讲过（费曼）和用过（完成任务）才算证据，没有证据就不要说用户学会了。学习档案里上次的差距，是这次对话的起点。";
 const PI_TOOLS = [
   {
     type: "function",
@@ -1561,6 +1583,44 @@ const PI_TOOLS = [
           },
         },
         required: ["event_title"],
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "assess_teachback",
+      description:
+        "教回评估：用户把自己的理解口头讲一遍后调用。对照该主题的知识点清单逐条判断是否讲清楚，covered=true 必须引用用户原话作为 quote。会生成评估草稿，用户点「应用本次教回」后才更新掌握度；应用前不写任何库。只使用清单里出现的知识点名，不要发明名字。",
+      parameters: {
+        type: "object",
+        properties: {
+          topic: { type: "string", description: "学习主题名或其一部分" },
+          results: {
+            type: "array",
+            description: "逐条评估结果；同一个知识点只评一条",
+            items: {
+              type: "object",
+              properties: {
+                point: {
+                  type: "string",
+                  description: "知识点名，与清单完全一致",
+                },
+                covered: { type: "boolean", description: "是否讲清楚了" },
+                quote: {
+                  type: "string",
+                  description: "用户原话引文；covered=true 时必填，遗漏可留空",
+                },
+              },
+              required: ["point", "covered"],
+            },
+          },
+          summary: {
+            type: "string",
+            description: "一句话总评：先补哪个、怎么补",
+          },
+        },
+        required: ["topic", "results"],
       },
     },
   },
@@ -2679,11 +2739,108 @@ function toolChallengeReminder(args: Record<string, unknown>): Record<string, un
     note: "已缓存为今晚 21:00 复习提醒的文案(仅本地缓存,不写库)。告知用户今晚提醒会用这句话。",
   };
 }
+// ── 教回评估(FSD §13,#9):assess_teachback 只产草稿,应用才走 applyTeachback 写库 ──
+function toolAssessTeachback(
+  args: Record<string, unknown>,
+  drafts: TeachbackDraft[],
+): Record<string, unknown> {
+  const topic = findTopic(String(args.topic || ""));
+  if (!topic)
+    return { error: `没有找到学习主题「${String(args.topic || "").trim()}」` };
+  if (!topicPoints(topic.id).length)
+    return {
+      error: "该主题还没有知识点",
+      note: "不要生成评估清单;建议用户先在掌握地图拆边界。",
+    };
+  const resolved = resolveTeachbackResults(topic.id, args.results);
+  if (!resolved.results.length)
+    return {
+      error:
+        "评估结果没有任何可解析的知识点;请对照主题知识点清单重新评估,point 须与知识点名完全一致",
+      unknown: resolved.unknown,
+    };
+  drafts.push({
+    topicId: topic.id,
+    topicTitle: topic.title,
+    summary: String(args.summary || "").trim().slice(0, 160),
+    items: resolved.results.map((item) => ({
+      pointId: item.pointId,
+      pointName: pointById(item.pointId)?.name || "",
+      covered: item.covered,
+      quote: item.quote,
+    })),
+    unknown: resolved.unknown,
+  });
+  return {
+    ok: true,
+    topic: topic.title,
+    resolved: resolved.results.length,
+    unknown: resolved.unknown,
+    note: "评估草稿已生成,等待用户在会话里点「应用本次教回」;应用前不要写库,也不要重复调用。",
+  };
+}
+/** 应用教回草稿:此前 mastery/loop_teachback 零变化;应用走 applyTeachback(covered 项推进,遗漏不自动降级) */
+function applyTeachbackDraft(message: ChatMessage) {
+  const draft = message.teachbackDraft;
+  if (!draft || draft.applied) return;
+  applyTeachback(
+    draft.topicId,
+    `voice:${new Date().toISOString()}`,
+    draft.items.map((item) => ({
+      pointId: item.pointId,
+      covered: item.covered,
+      quote: item.quote,
+    })),
+  );
+  draft.applied = true;
+  bumpLoop();
+}
+/** 已应用后遗漏项「记一次没讲清」:一次 forgot 证据,状态由 §5.1 规则重算(不做状态承诺) */
+function markTeachbackMiss(message: ChatMessage, index: number) {
+  const draft = message.teachbackDraft;
+  const item = draft?.items[index];
+  if (!draft || !item || item.covered || item.marked) return;
+  applyPointEvidence(item.pointId, false);
+  item.marked = true;
+  bumpLoop();
+}
+/** 教回入口(FSD §13):复用 transcribe();无识别结果不调模型零写库;转录+知识点清单走 askPi */
+async function startTeachback(topic: LearningTopic) {
+  if (!topicPoints(topic.id).length) {
+    messages.value.push({
+      role: "assistant",
+      content: `「${topic.title}」还没有知识点。先在掌握地图拆边界:这个主题里,哪些是你还说不清的?`,
+    });
+    chatOpen.value = true;
+    return;
+  }
+  let transcript = "";
+  try {
+    transcript = (await transcribe()) || "";
+  } catch {
+    transcript = "";
+  }
+  if (!transcript.trim()) {
+    messages.value.push({
+      role: "assistant",
+      content: "没有识别到语音,再按一次「教回」重试。",
+    });
+    chatOpen.value = true;
+    return;
+  }
+  const points = topicPoints(topic.id)
+    .map((point) => `${point.name}(${bloomNames[point.bloomLevel]})`)
+    .join("、");
+  await askPi(
+    `我用 2 分钟讲了「${topic.title}」,请用 assess_teachback 对照知识点清单评估我讲清楚了什么:${transcript}\n(知识点清单:${points})`,
+  );
+}
 async function executeTool(
   name: string,
   args: Record<string, unknown>,
   suggestions: EventSuggestion[],
   challengeDrafts: ChallengeSuggestion[],
+  teachbackDrafts: TeachbackDraft[],
 ): Promise<Record<string, unknown>> {
   if (name === "query_day") return toolQueryDay(args);
   if (name === "plan_goal") return await toolPlanGoal(args);
@@ -2698,6 +2855,7 @@ async function executeTool(
   if (name === "create_challenge") return toolCreateChallenge(args, challengeDrafts);
   if (name === "draft_cards") return toolDraftCards(args);
   if (name === "challenge_reminder") return toolChallengeReminder(args);
+  if (name === "assess_teachback") return toolAssessTeachback(args, teachbackDrafts);
   return { error: `未知工具 ${name}` };
 }
 async function runPiAgent(
@@ -2706,6 +2864,7 @@ async function runPiAgent(
   reply: string;
   suggestions: EventSuggestion[];
   challengeDrafts: ChallengeSuggestion[];
+  teachbackDrafts: TeachbackDraft[];
 }> {
   if (!aiConfig.value) throw new Error("未配置模型。");
   const chat: Record<string, unknown>[] = [
@@ -2753,6 +2912,7 @@ async function runPiAgent(
   ];
   const suggestions: EventSuggestion[] = [];
   const challengeDrafts: ChallengeSuggestion[] = [];
+  const teachbackDrafts: TeachbackDraft[] = [];
   for (let round = 0; round < 3; round++) {
     let result: ModelChatResult;
     try {
@@ -2783,7 +2943,7 @@ async function runPiAgent(
     if (!calls.length) {
       const reply =
         message?.content?.trim() || modelReply(result) || "暂时没有收到回复。";
-      return { reply, suggestions, challengeDrafts };
+      return { reply, suggestions, challengeDrafts, teachbackDrafts };
     }
     chat.push({
       role: "assistant",
@@ -2801,7 +2961,13 @@ async function runPiAgent(
       } catch {
         args = {};
       }
-      const output = await executeTool(name, args, suggestions, challengeDrafts);
+      const output = await executeTool(
+        name,
+        args,
+        suggestions,
+        challengeDrafts,
+        teachbackDrafts,
+      );
       chat.push({
         role: "tool",
         tool_call_id: call.id,
@@ -2813,6 +2979,7 @@ async function runPiAgent(
     reply: "这次调用的工具有点多，先到这里；需要继续随时叫我。",
     suggestions,
     challengeDrafts,
+    teachbackDrafts,
   };
 }
 function extractJsonObject(text: string): { events?: unknown[] } | null {
@@ -2896,10 +3063,12 @@ async function askPi(text?: string) {
   chatText.value = "";
   chatBusy.value = true;
   try {
-    const { reply, suggestions, challengeDrafts } = await runPiAgent(message);
+    const { reply, suggestions, challengeDrafts, teachbackDrafts } =
+      await runPiAgent(message);
     const replyMessage: ChatMessage = { role: "assistant", content: reply };
     if (suggestions.length) replyMessage.suggestions = suggestions;
     if (challengeDrafts.length) replyMessage.challengeDraft = challengeDrafts[0];
+    if (teachbackDrafts.length) replyMessage.teachbackDraft = teachbackDrafts[0];
     messages.value.push(replyMessage);
     void scrollChatToBottom();
   } catch (error) {
@@ -3683,6 +3852,66 @@ onMounted(() => {
                     </button>
                   </div>
                 </div>
+                <div
+                  v-if="message.teachbackDraft"
+                  class="chat-save-list"
+                >
+                  <div class="chat-teachback">
+                    <p class="chat-teachback-title">
+                      <Mic :size="12" />教回评估{{
+                        message.teachbackDraft.applied ? "(已应用)" : "(未应用,点应用才写入)"
+                      }}
+                    </p>
+                    <p
+                      v-if="message.teachbackDraft.summary"
+                      class="chat-challenge-note"
+                    >
+                      {{ message.teachbackDraft.summary }}
+                    </p>
+                    <div
+                      v-for="(item, itemIndex) in message.teachbackDraft.items"
+                      :key="item.pointId"
+                      class="chat-teachback-item"
+                    >
+                      <span
+                        class="chat-teachback-status"
+                        :class="item.covered ? 'ok' : 'miss'"
+                        >{{ item.covered ? "讲清" : "遗漏" }}</span
+                      >
+                      <span class="chat-teachback-text">
+                        <b>{{ item.pointName }}</b>
+                        <i v-if="item.covered && item.quote">「{{ item.quote }}」</i>
+                        <em v-if="item.marked">已记一次没讲清</em>
+                      </span>
+                      <button
+                        v-if="
+                          message.teachbackDraft?.applied &&
+                          !item.covered &&
+                          !item.marked
+                        "
+                        type="button"
+                        class="chat-save"
+                        @click="markTeachbackMiss(message, itemIndex)"
+                      >
+                        记一次没讲清
+                      </button>
+                    </div>
+                    <p
+                      v-if="message.teachbackDraft.unknown.length"
+                      class="chat-challenge-note"
+                    >
+                      无法对应知识点:{{ message.teachbackDraft.unknown.join("、") }}
+                    </p>
+                    <button
+                      v-if="!message.teachbackDraft.applied"
+                      type="button"
+                      class="chat-save"
+                      @click="applyTeachbackDraft(message)"
+                    >
+                      <Check :size="11" />应用本次教回
+                    </button>
+                  </div>
+                </div>
               </div>
             </div>
             <div v-if="chatBusy" class="chat-message assistant">
@@ -3805,6 +4034,8 @@ onMounted(() => {
                   @click="askPi(`用费曼学习法检验我对「${topic.title}」的掌握。`)"
                 >
                   <Mic :size="13" />讲一次</button
+                ><button @click="startTeachback(topic)">
+                  <Mic :size="13" />教回</button
                 ><button
                   v-if="topic.status !== 'paused'"
                   aria-label="搁置主题"

@@ -888,6 +888,69 @@ export function applyTeachback(
   persist();
 }
 
+/** 主题的教回记录(#9 读取器:测试与后续反馈引导用) */
+export function teachbacksForTopic(topicId: string): {
+  id: string;
+  transcriptId: string;
+  result: TeachbackResult[];
+  createdAt: string;
+}[] {
+  return store.teachbacks.filter((item) => item.topicId === topicId);
+}
+
+// ── 费曼教回(FSD §13,issue #9):assess_teachback 产出为草稿,应用才写库 ──
+
+/** 教回引文截断上限 */
+export const TEACHBACK_QUOTE_LIMIT = 120;
+
+export interface TeachbackDraftResult {
+  pointId: string;
+  covered: boolean;
+  quote: string;
+}
+
+export interface ResolvedTeachback {
+  results: TeachbackDraftResult[];
+  /** 主题内不存在的知识点名(去重) */
+  unknown: string[];
+}
+
+/**
+ * 教回评估草稿归一化(纯读,零写库):
+ * 按主题内 UNIQUE 知识点名解析 pointId,未知名剔除并进 unknown;
+ * covered 须带非空引文,否则按未覆盖;quote 先 trim 再截 120 字;重复点名只保留首条。
+ */
+export function resolveTeachbackResults(
+  topicId: string,
+  raw: unknown,
+): ResolvedTeachback {
+  const list = Array.isArray(raw) ? raw : [];
+  const results: TeachbackDraftResult[] = [];
+  const unknown: string[] = [];
+  const seen = new Set<string>();
+  for (const item of list) {
+    const record = (item || {}) as Record<string, unknown>;
+    const name = String(record.point ?? "").trim();
+    if (!name) continue; // 没有点名的条目无法报告,直接跳过
+    const point = store.points.find(
+      (candidate) => candidate.topicId === topicId && candidate.name === name,
+    );
+    if (!point) {
+      if (!unknown.includes(name)) unknown.push(name);
+      continue;
+    }
+    if (seen.has(point.id)) continue; // 重复点名保留首条
+    seen.add(point.id);
+    const quote = String(record.quote ?? "").trim().slice(0, TEACHBACK_QUOTE_LIMIT);
+    results.push({
+      pointId: point.id,
+      covered: record.covered === true && quote.length > 0,
+      quote,
+    });
+  }
+  return { results, unknown };
+}
+
 export function topicPoints(topicId: string): KnowledgePoint[] {
   return store.points.filter((item) => item.topicId === topicId);
 }

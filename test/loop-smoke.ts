@@ -2,6 +2,7 @@
 // 覆盖 FSD P0 验收清单中的规则部分:幂等结算、冻结、补签、SM-2、BKT 四态、队列截断
 // 以及 §6.1 Issue #8:Pi 三工具纯逻辑(草稿规整/确认幂等/来源读取/批量校验/文案选择/goal_note 迁移)
 // 以及 §14 Issue #16:启动零摩擦(microStepOf/resolveNextAction/轻打卡幂等依赖)
+// 以及 §13 Issue #9:费曼教回(resolveTeachbackResults/遗漏不降级/BKT forgot 数值锁定)
 import * as loop from "../src/learningLoop";
 import { native } from "./stubs/core.mjs";
 import { fakeDb } from "./stubs/sqlite.mjs";
@@ -598,10 +599,142 @@ async function zeroFrictionTests() {
   );
 }
 
+// ══ FSD §13 Issue #9:费曼教回纯逻辑 ══
+async function teachbackTests() {
+  const t = "t-teach";
+  const pa = loop.addKnowledgePoint({ topicId: t, name: "p 值的含义" });
+  const pb = loop.addKnowledgePoint({ topicId: t, name: "置信区间" });
+  ok(!("error" in pa) && !("error" in pb), "#9 建两个知识点");
+  const paR = pa as Exclude<typeof pa, { error: string }>;
+  const pbR = pb as Exclude<typeof pb, { error: string }>;
+
+  // 1) 名称精确匹配 → pointId;不存在的名进 unknown 且不产生应用条目
+  const resolved = loop.resolveTeachbackResults(t, [
+    { point: "p 值的含义", covered: true, quote: "p 值就是…" },
+    { point: "不存在的知识点", covered: true, quote: "引文" },
+  ]);
+  ok(
+    resolved.results.length === 1 &&
+      resolved.results[0]?.pointId === paR.id &&
+      resolved.results[0]?.covered === true,
+    "知识点名精确匹配解析为 pointId",
+    resolved,
+  );
+  ok(
+    resolved.unknown.length === 1 && resolved.unknown[0] === "不存在的知识点",
+    "主题内不存在的名进 unknown 且不产生应用条目",
+    resolved.unknown,
+  );
+
+  // 2) covered 空引文归一化 / quote trim 后截 120 / 重复点名保留首条
+  const longQuote = "很长的引文".repeat(40); // 200 字
+  const normalized = loop.resolveTeachbackResults(t, [
+    { point: "p 值的含义", covered: true, quote: "   " },
+    { point: "置信区间", covered: true, quote: `  ${longQuote}  ` },
+    { point: "p 值的含义", covered: false, quote: "重复条目应被丢弃" },
+  ]);
+  ok(normalized.results.length === 2, "同一知识点重复出现只保留首条", normalized);
+  const firstItem = normalized.results[0];
+  const secondItem = normalized.results[1];
+  ok(
+    !!firstItem && firstItem.covered === false && firstItem.quote === "",
+    "covered 但引文为空白 → 按未覆盖处理",
+    firstItem,
+  );
+  ok(
+    !!secondItem &&
+      secondItem.covered === true &&
+      secondItem.quote === longQuote.slice(0, 120),
+    "quote 先 trim 再截 120 字",
+    secondItem?.quote.length,
+  );
+
+  // 3) 归一化结果经 applyTeachback:covered 推进,遗漏项 mastery/lastEvidenceAt 不变
+  const missingBefore = {
+    mastery: loop.pointById(pbR.id)!.mastery,
+    lastEvidenceAt: loop.pointById(pbR.id)!.lastEvidenceAt,
+  };
+  const draft = loop.resolveTeachbackResults(t, [
+    { point: "p 值的含义", covered: true, quote: "p 值越小越有理由拒绝原假设" },
+    { point: "置信区间", covered: false, quote: "" },
+  ]);
+  const rowsBefore = loop.teachbacksForTopic(t).length;
+  loop.applyTeachback(
+    t,
+    "voice:test-1",
+    draft.results.map((item) => ({ ...item })),
+  );
+  ok(loop.pointById(paR.id)!.mastery > 0, "covered 项经 applyTeachback 推进 mastery");
+  const pbAfter = loop.pointById(pbR.id)!;
+  ok(
+    pbAfter.mastery === missingBefore.mastery &&
+      pbAfter.lastEvidenceAt === missingBefore.lastEvidenceAt,
+    "遗漏项 mastery 与 lastEvidenceAt 前后相等(不自动降级)",
+    { before: missingBefore, after: { mastery: pbAfter.mastery, lastEvidenceAt: pbAfter.lastEvidenceAt } },
+  );
+  const rows = loop.teachbacksForTopic(t);
+  ok(rows.length === rowsBefore + 1, "loop_teachback 恰增 1 行", rows.length);
+  ok(
+    rows[rows.length - 1]?.result.length === draft.results.length &&
+      JSON.stringify(rows[rows.length - 1]?.result) ===
+        JSON.stringify(draft.results),
+    "result 回读与入参 results 全量一致",
+  );
+
+  // 4) applyPointEvidence(pointId,false) 数值锁定(防 BKT 参数漂移)
+  const pc = loop.addKnowledgePoint({ topicId: t, name: "标准差" });
+  const pd = loop.addKnowledgePoint({ topicId: t, name: "抽样偏差" });
+  ok(!("error" in pc) && !("error" in pd), "#9 建数值锁定用知识点");
+  const pcR = pc as Exclude<typeof pc, { error: string }>;
+  const pdR = pd as Exclude<typeof pd, { error: string }>;
+  const pcPoint = loop.pointById(pcR.id)!;
+  pcPoint.mastery = 0.85;
+  pcPoint.status = "mastered";
+  loop.applyPointEvidence(pcR.id, false);
+  ok(
+    Math.abs(pcPoint.mastery - 0.5024) < 0.001 && pcPoint.status === "shaky",
+    "mastery=0.85 一次 forgot → ≈0.5024 → shaky",
+    { mastery: pcPoint.mastery, status: pcPoint.status },
+  );
+  const pdPoint = loop.pointById(pdR.id)!;
+  pdPoint.mastery = 0.99;
+  pdPoint.status = "mastered";
+  loop.applyPointEvidence(pdR.id, false);
+  ok(
+    Math.abs(pdPoint.mastery - 0.9364) < 0.001 && pdPoint.status === "mastered",
+    "mastery=0.99 一次 forgot → ≈0.9364 仍 mastered",
+    { mastery: pdPoint.mastery, status: pdPoint.status },
+  );
+  loop.applyPointEvidence(pdR.id, false);
+  ok(
+    Math.abs(pdPoint.mastery - 0.7008) < 0.001 && pdPoint.status === "shaky",
+    "mastery=0.99 两次 forgot → ≈0.7008 → shaky",
+    { mastery: pdPoint.mastery, status: pdPoint.status },
+  );
+
+  // 5) 空清单主题(全部条目 unknown):results 空、仍可写 1 行全遗漏记录
+  const emptyResolved = loop.resolveTeachbackResults(t, [
+    { point: "不存在甲", covered: true, quote: "x" },
+    { point: "不存在乙", covered: false, quote: "" },
+  ]);
+  ok(
+    emptyResolved.results.length === 0 && emptyResolved.unknown.length === 2,
+    "全部条目未知 → results 空数组、全进 unknown",
+    emptyResolved,
+  );
+  const rowsBeforeEmpty = loop.teachbacksForTopic(t).length;
+  loop.applyTeachback(t, "voice:test-empty", emptyResolved.results);
+  ok(
+    loop.teachbacksForTopic(t).length === rowsBeforeEmpty + 1,
+    "全遗漏记录仍写入 1 行 loop_teachback",
+  );
+}
+
 void (async () => {
   try {
     await piToolTests();
     await zeroFrictionTests();
+    await teachbackTests();
   } catch (error) {
     fail += 1;
     console.log("  FAIL Pi 工具用例异常", error);
