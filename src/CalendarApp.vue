@@ -279,17 +279,64 @@ const topicForm = ref<{
   nextStep: string;
 }>({ id: "", title: "", why: "", useCase: "", status: "learning", nextStep: "" });
 function openTopicDialog(topic?: LearningTopic) {
-  topicForm.value = topic
-    ? {
-        id: topic.id,
-        title: topic.title,
-        why: topic.why,
-        useCase: topic.useCase,
-        status: topic.status,
-        nextStep: topic.nextStep,
-      }
-    : { id: "", title: "", why: "", useCase: "", status: "learning", nextStep: "" };
+  if (!topic) return; // 创建一律走 quick-topic 一句话入口;表单只用于编辑
+  topicForm.value = {
+    id: topic.id,
+    title: topic.title,
+    why: topic.why,
+    useCase: topic.useCase,
+    status: topic.status,
+    nextStep: topic.nextStep,
+  };
   dialog.value = "topic";
+}
+// ── 说一句建主题(FSD §16.1 延伸,#16):创建 = 一句话/一段语音,字段由 Pi 补 ──
+const quickTopicText = ref("");
+const quickTopicListening = ref(false);
+const quickTopicInput = ref<HTMLInputElement | null>(null);
+function focusQuickTopic() {
+  void nextTick(() => quickTopicInput.value?.focus());
+}
+async function recordQuickTopicVoice() {
+  if (quickTopicListening.value) {
+    stopVoice();
+    quickTopicListening.value = false;
+    return;
+  }
+  quickTopicListening.value = true;
+  try {
+    const transcript = await transcribe();
+    if (transcript)
+      quickTopicText.value = quickTopicText.value
+        ? `${quickTopicText.value} ${transcript}`
+        : transcript;
+  } catch (error) {
+    messages.value.push({
+      role: "assistant",
+      content:
+        error instanceof Error ? error.message : "语音识别失败,请重试。",
+    });
+    chatOpen.value = true;
+  } finally {
+    quickTopicListening.value = false;
+  }
+}
+function submitQuickTopic() {
+  const text = quickTopicText.value.trim();
+  if (!text) return;
+  if (chatBusy.value) {
+    // Pi 忙时不静默丢弃:文本留在输入框,提示稍后发送
+    messages.value.push({
+      role: "assistant",
+      content: "Pi 正在回复上一条,稍等片刻再按一次发送。",
+    });
+    chatOpen.value = true;
+    return;
+  }
+  quickTopicText.value = "";
+  void askPi(
+    `我想学「${text}」。帮我建学习主题:为什么学、打算在哪用由你推断,不确定的最多问我一个问题;建完立刻给我第一个 2 分钟就能动手的任务,别让我停下来。`,
+  );
 }
 function saveTopicDialog() {
   const title = topicForm.value.title.trim().slice(0, 40);
@@ -4191,9 +4238,34 @@ onMounted(() => {
           </section>
         <section v-if="view === 'learn'" class="learn-wrap">
           <div class="learn-head">
-            <span><strong>学习主题</strong><small>讲过、用过，才算学会</small></span>
-            <button class="learn-add" @click="openTopicDialog()">
-              <Plus :size="15" />新主题
+            <span><strong>学习主题</strong><small>说一句就建,讲过、用过才算学会</small></span>
+            <button class="learn-add" @click="focusQuickTopic()">
+              <Mic :size="15" />说一个
+            </button>
+          </div>
+          <div class="quick-topic">
+            <input
+              ref="quickTopicInput"
+              v-model="quickTopicText"
+              maxlength="60"
+              placeholder="想学什么?一句话,或按麦说话"
+              @keydown.enter.prevent="submitQuickTopic()"
+            /><button
+              type="button"
+              class="qt-voice"
+              :class="{ recording: quickTopicListening }"
+              :aria-label="quickTopicListening ? '停止语音' : '语音说想学什么'"
+              @click="recordQuickTopicVoice()"
+            >
+              <Mic :size="16" /></button
+            ><button
+              type="button"
+              class="qt-go"
+              aria-label="交给 Pi 建主题"
+              :disabled="!quickTopicText.trim()"
+              @click="submitQuickTopic()"
+            >
+              <Sparkles :size="15" />
             </button>
           </div>
           <div class="loop-bar">
@@ -4309,9 +4381,9 @@ onMounted(() => {
           <div v-else class="learn-empty">
             <Sparkles :size="26" />
             <strong>还没有学习主题</strong>
-            <span>学之前先想清楚：为什么学、打算在哪用。</span>
-            <button class="learn-add big" @click="openTopicDialog()">
-              <Plus :size="15" />建第一个主题
+            <span>在上面说一句"我想学 XX",Pi 替你建好并给出第一个动手任务。</span>
+            <button class="learn-add big" @click="focusQuickTopic()">
+              <Mic :size="15" />说一个想学的
             </button>
           </div>
         </section>

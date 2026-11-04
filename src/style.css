@@ -446,3 +446,11 @@ body{padding:env(safe-area-inset-top) env(safe-area-inset-right) env(safe-area-i
 .review-transition{display:block;margin-top:5px;color:#79837a;font-size:10px;text-align:left}
 .review-summary{display:block;margin-top:4px;color:#79837a;font-size:10px}
 @media(max-width:620px){.loop-review-go{min-height:44px;font-size:14px}.map-add{grid-template-columns:1fr auto}.map-add .primary-button{grid-column:1/-1}.review-grades .grade{min-height:48px}}
+
+/* ── 说一句建主题(#16 延伸):一句话/一段语音,字段由 Pi 补 ── */
+.quick-topic{display:flex;gap:7px;margin-bottom:12px}
+.quick-topic input{flex:1;min-width:0;min-height:40px;padding:0 14px;border:1px solid var(--card-line);border-radius:20px;background:#fff;font-size:13px}
+.quick-topic input:focus{outline:2px solid #88a956;outline-offset:1px}
+.quick-topic .qt-voice{display:grid;width:40px;height:40px;place-items:center;border:0;border-radius:50%;background:#f4f8ea;color:var(--leaf-deep,#5c723f);cursor:pointer}
+.quick-topic .qt-go{display:grid;width:40px;height:40px;place-items:center;border:0;border-radius:20px;background:linear-gradient(135deg,#c6e08a,#8fb554);color:#fff;cursor:pointer}
+.quick-topic .qt-go:disabled{opacity:.45;cursor:default}
