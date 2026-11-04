@@ -3009,15 +3009,18 @@ async function startTeachback(topic: LearningTopic) {
     return;
   }
   let transcript = "";
+  let transcribeError: string | null = null;
   try {
     transcript = (await transcribe()) || "";
-  } catch {
-    transcript = "";
+  } catch (error) {
+    // 权限被拒、环境不支持等具体原因要透传,不能统一吞成"没有识别到语音"
+    transcribeError =
+      error instanceof Error ? error.message : "语音识别失败,请重试。";
   }
   if (!transcript.trim()) {
     messages.value.push({
       role: "assistant",
-      content: "没有识别到语音,再按一次「教回」重试。",
+      content: transcribeError || "没有识别到语音,再按一次「教回」重试。",
     });
     chatOpen.value = true;
     return;
@@ -3025,9 +3028,19 @@ async function startTeachback(topic: LearningTopic) {
   const points = topicPoints(topic.id)
     .map((point) => `${point.name}(${bloomNames[point.bloomLevel]})`)
     .join("、");
-  await askPi(
-    `我用 2 分钟讲了「${topic.title}」,请用 assess_teachback 对照知识点清单评估我讲清楚了什么:${transcript}\n(知识点清单:${points})`,
-  );
+  const teachbackPrompt = `我用 2 分钟讲了「${topic.title}」,请用 assess_teachback 对照知识点清单评估我讲清楚了什么:${transcript}\n(知识点清单:${points})`;
+  if (chatBusy.value) {
+    // Pi 正在回复上一条:教回内容放进输入框等发送,不静默丢弃
+    chatText.value = teachbackPrompt;
+    messages.value.push({
+      role: "assistant",
+      content:
+        "你的讲解我收到了,但 Pi 正在回复上一条消息。内容已放进输入框,等它说完按发送即可开始评估。",
+    });
+    chatOpen.value = true;
+    return;
+  }
+  await askPi(teachbackPrompt);
 }
 async function executeTool(
   name: string,
