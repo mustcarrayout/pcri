@@ -9,6 +9,7 @@ import { SpeechRecognition } from "@capacitor-community/speech-recognition";
 import { SecureStoragePlugin } from "capacitor-secure-storage-plugin";
 import { LocalNotifications } from "@capacitor/local-notifications";
 import { getDayMeta } from "./calendarMeta";
+import { speak, stopSpeak } from "./speech";
 import {
   isDue,
   loadFiredMap,
@@ -100,6 +101,8 @@ import {
   Tag,
   Trash2,
   Trophy,
+  Volume2,
+  VolumeX,
   X,
 } from "lucide-vue-next";
 
@@ -379,6 +382,24 @@ const search = ref("");
 const messages = ref<ChatMessage[]>([]);
 const chatText = ref("");
 const chatBusy = ref(false);
+// ── 语音播报(#18):语音发起的对话自动播报;手动喇叭重播/停止 ──
+const speakingMsgIndex = ref(-1);
+const voiceInitiated = ref(false);
+async function toggleSpeak(message: ChatMessage, index: number) {
+  if (speakingMsgIndex.value === index) {
+    speakingMsgIndex.value = -1;
+    await stopSpeak();
+    return;
+  }
+  speakingMsgIndex.value = index;
+  await stopSpeak(); // 打断上一条播报
+  try {
+    await speak(message.content);
+  } catch {
+    /* 真机无中文 TTS 引擎时静默 */
+  }
+  if (speakingMsgIndex.value === index) speakingMsgIndex.value = -1;
+}
 const chatListening = ref(false);
 const chatHistoryEl = ref<HTMLElement | null>(null);
 const chatOpen = ref(false);
@@ -1066,10 +1087,12 @@ async function toggleChatVoice() {
   chatListening.value = true;
   try {
     const transcript = await transcribe();
-    if (transcript)
+    if (transcript) {
       chatText.value = chatText.value
         ? `${chatText.value} ${transcript}`
         : transcript;
+      voiceInitiated.value = true; // 语音发起 → 回复自动播报(#18)
+    }
   } catch (error) {
     messages.value.push({
       role: "assistant",
@@ -3075,6 +3098,7 @@ async function startTeachback(topic: LearningTopic) {
   const points = topicPoints(topic.id)
     .map((point) => `${point.name}(${bloomNames[point.bloomLevel]})`)
     .join("、");
+  voiceInitiated.value = true; // 教回是语音行为:评估结果自动播报(#18)
   const teachbackPrompt = `我用 2 分钟讲了「${topic.title}」,请用 assess_teachback 对照知识点清单评估我讲清楚了什么:${transcript}\n(知识点清单:${points})`;
   if (chatBusy.value) {
     // Pi 正在回复上一条:教回内容放进输入框等发送,不静默丢弃
@@ -3303,6 +3327,8 @@ function draftCardsFromEvent() {
 async function askPi(text?: string) {
   const message = (text || chatText.value).trim();
   if (!message || chatBusy.value) return;
+  const fromVoice = voiceInitiated.value; // 语音发起 → 回复自动播报(#18)
+  voiceInitiated.value = false;
   chatOpen.value = true;
   if (!aiConfig.value) {
     messages.value.push({
@@ -3325,6 +3351,8 @@ async function askPi(text?: string) {
     if (teachbackDrafts.length) replyMessage.teachbackDraft = teachbackDrafts[0];
     messages.value.push(replyMessage);
     void scrollChatToBottom();
+    if (fromVoice && reply.trim())
+      void toggleSpeak(replyMessage, messages.value.length - 1);
   } catch (error) {
     messages.value.push({
       role: "assistant",
@@ -4048,6 +4076,19 @@ onMounted(() => {
               /></span>
               <div class="chat-body">
                 <p>{{ message.content }}</p>
+                <button
+                  v-if="message.role === 'assistant' && message.content"
+                  type="button"
+                  class="chat-speak"
+                  :class="{ on: speakingMsgIndex === index }"
+                  :aria-label="speakingMsgIndex === index ? '停止播报' : '播报这条回复'"
+                  @click="toggleSpeak(message, index)"
+                >
+                  <VolumeX v-if="speakingMsgIndex === index" :size="12" /><Volume2
+                    v-else
+                    :size="12"
+                  />
+                </button>
                 <div
                   v-if="message.suggestions?.length"
                   class="chat-save-list"
