@@ -3641,13 +3641,17 @@ onMounted(() => {
   }
   void loadAiConfig();
   void bootstrapDingTalk();
-  void openDatabase().then(() => migrateToTopics());
-  void initLoopStorage().then((backendName) => {
-    loopBackendName.value = backendName;
-    runDailySettle();
-    bumpLoop();
-    void syncLoopNotifications();
-  });
+  // 学习闭环复用 openDatabase 打开的同一条 SQLite 连接:
+  // 同库开第二条 createConnection 会失败并静默退回 localStorage(真机 2026-11-04 实证)
+  void openDatabase()
+    .then(() => migrateToTopics())
+    .then(() => initLoopStorage(db.value))
+    .then((backendName) => {
+      loopBackendName.value = backendName;
+      runDailySettle();
+      bumpLoop();
+      void syncLoopNotifications();
+    });
 });
 </script>
 

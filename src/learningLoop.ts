@@ -233,10 +233,13 @@ function loadLocal() {
   }
 }
 
-/** SQLite 写入:表都很小(个人规模),整表重写最简单且不会漏行 */
+/**
+ * SQLite 写入:表都很小(个人规模),整表重写最简单且不会漏行。
+ * 不用显式 BEGIN/COMMIT:连接与 CalendarApp.saveEvents 共享,桥接层语句交错
+ * 会出现"嵌套事务"错误;失败时下一次 persist 全表重写,自愈。
+ */
 async function saveSqlite() {
   if (!db) return;
-  await db.execute("BEGIN");
   try {
     await db.execute(
       "DELETE FROM loop_challenge; DELETE FROM loop_checkin; DELETE FROM loop_point; DELETE FROM loop_card; DELETE FROM loop_review_log; DELETE FROM loop_teachback;",
@@ -296,10 +299,8 @@ async function saveSqlite() {
         `INSERT INTO loop_teachback (id,topic_id,transcript_id,result_json,created_at) VALUES (?,?,?,?,?)`,
         [t.id, t.topicId, t.transcriptId, JSON.stringify(t.result), t.createdAt],
       );
-    await db.execute("COMMIT");
   } catch {
-    await db.execute("ROLLBACK").catch(() => undefined);
-    throw new Error("学习闭环数据保存失败");
+    // 失败不阻塞交互:下一次 persist 全表重写,自愈
   }
 }
 
@@ -314,9 +315,29 @@ function persist() {
   }
 }
 
-/** 初始化学习闭环存储;返回使用的后端名 */
-export async function initLoopStorage(): Promise<"sqlite" | "local"> {
-  if (await initSqlite()) {
+/**
+ * 初始化学习闭环存储;返回使用的后端名。
+ * 优先复用 CalendarApp 已打开的连接——同一 SQLite 库开第二条连接在插件层会失败
+ * 并静默退回 localStorage(真机冒烟 2026-11-04 抓到),因此主路径必须传 existing。
+ * existing 用 unknown 收窄:插件内 SQLiteDBConnection 存在类/接口两处声明,跨文件
+ * 名义类型不互通,按方法形状断言即可。
+ */
+export async function initLoopStorage(
+  existing?: unknown,
+): Promise<"sqlite" | "local"> {
+  const conn = existing as SQLiteDBConnection | null | undefined;
+  if (conn) {
+    db = conn;
+    backend = "sqlite";
+  } else if (await initSqlite()) {
+    // 兜底:调用方没有连接时自行打开(独立使用本模块的场景)
+  } else {
+    loadLocal();
+    return backend;
+  }
+  await db!.execute(SCHEMA);
+  await migrateLoopSchema();
+  {
     const ch = await db!.query("SELECT * FROM loop_challenge");
     store.challenges = (ch.values || []).map((row) => ({
       id: String(row.id),
@@ -380,8 +401,6 @@ export async function initLoopStorage(): Promise<"sqlite" | "local"> {
       result: JSON.parse(String(row.result_json || "[]")) as TeachbackResult[],
       createdAt: String(row.created_at),
     }));
-  } else {
-    loadLocal();
   }
   return backend;
 }
